@@ -4,54 +4,112 @@ import os.path
 from queue import Queue
 from threading import Thread
 
+import cv2
 import torch
-from PIL import Image
+import torch.utils.data
+import numpy as np
+
+from histogram import match_histograms
 
 
 def get_loader(my_dataset, device, batch_size, num_workers, shuffle):
     """ 根据dataset及设置，获取对应的 DataLoader """
     my_loader = torch.utils.data.DataLoader(my_dataset, batch_size=batch_size, num_workers=num_workers,
-                                            shuffle=shuffle, pin_memory=True, persistent_workers=True)
+                                            shuffle=shuffle, pin_memory=True, persistent_workers=(num_workers > 0))
     if torch.cuda.is_available():
         my_loader = CudaDataLoader(my_loader, device=device)
     return my_loader
+
+
+class MatchHistogramsDataset(torch.utils.data.Dataset):
+
+    IMG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif']
+
+    def __init__(self, root, transform=None, target_transform=None, is_match_histograms=False, match_mode=True,
+                 b2a_prob=0.5, match_ratio=1.0):
+        """ 获取指定的两个文件夹下，两张图像numpy数组的Dataset """
+        assert len(root) == 2, f'root of MatchHistogramsDataset must has two dir!'
+        self.dataset_0 = DatasetFolder(root[0])
+        self.dataset_1 = DatasetFolder(root[1])
+
+        self.transform = transform
+        self.target_transform = target_transform
+        self.len_0 = len(self.dataset_0)
+        self.len_1 = len(self.dataset_1)
+        self.len = max(self.len_0, self.len_1)
+        self.is_match_histograms = is_match_histograms
+        self.match_mode = match_mode
+        assert self.match_mode in ('hsv', 'hsl', 'rgb'), f'match mode must in {self.match_mode}'
+        self.b2a_prob = b2a_prob
+        self.match_ratio = match_ratio
+
+    def __getitem__(self, index):
+        sample_0 = self.dataset_0[index] if index < self.len_0 else self.dataset_1[np.random.randint(self.len_0)]
+        sample_1 = self.dataset_1[index] if index < self.len_1 else self.dataset_1[np.random.randint(self.len_1)]
+
+        if self.is_match_histograms:
+            if self.match_mode == 'hsv':
+                sample_0 = cv2.cvtColor(sample_0, cv2.COLOR_RGB2HSV_FULL)
+                sample_1 = cv2.cvtColor(sample_1, cv2.COLOR_RGB2HSV_FULL)
+            elif self.match_mode == 'hsl':
+                sample_0 = cv2.cvtColor(sample_0, cv2.COLOR_RGB2HLS_FULL)
+                sample_1 = cv2.cvtColor(sample_1, cv2.COLOR_RGB2HLS_FULL)
+
+            if np.random.rand() < self.b2a_prob:
+                sample_1 = match_histograms(sample_1, sample_0, rate=self.match_ratio)
+            else:
+                sample_0 = match_histograms(sample_0, sample_1, rate=self.match_ratio)
+
+            if self.match_mode == 'hsv':
+                sample_0 = cv2.cvtColor(sample_0, cv2.COLOR_HSV2RGB_FULL)
+                sample_1 = cv2.cvtColor(sample_1, cv2.COLOR_HSV2RGB_FULL)
+            elif self.match_mode == 'hsl':
+                sample_0 = cv2.cvtColor(sample_0, cv2.COLOR_HLS2RGB_FULL)
+                sample_1 = cv2.cvtColor(sample_1, cv2.COLOR_HLS2RGB_FULL)
+
+        if self.transform is not None:
+            sample_0 = self.transform(sample_0)
+            sample_1 = self.transform(sample_1)
+
+        return sample_0, sample_1
+
+    def __len__(self):
+        return self.len
+
+    def __repr__(self):
+        fmt_str = f'MatchHistogramsDataset for: \n' \
+                  f'{self.dataset_0.__repr__()} \n ' \
+                  f'{self.dataset_1.__repr__()}'
+        return fmt_str
 
 
 class DatasetFolder(torch.utils.data.Dataset):
 
     IMG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif']
 
-    def __init__(self, root, transform=None, target_transform=None):
-        """ dataset """
+    def __init__(self, root, transform=None):
+        """ 获取指定文件夹下，单张图像numpy数组的Dataset """
         samples = []
         for sub_root, _, filenames in sorted(os.walk(root)):
             for filename in sorted(filenames):
                 if os.path.splitext(filename)[-1].lower() in self.IMG_EXTENSIONS:
                     path = os.path.join(sub_root, filename)
-                    item = (path, 0)
-                    samples.append(item)
+                    samples.append(path)
 
         if len(samples) == 0:
             raise RuntimeError(f"Found 0 files in sub-folders of: {root}\n"
                                f"Supported extensions are: {','.join(self.IMG_EXTENSIONS)}")
 
         self.root = root
-        self.loader = self.default_loader
-        self.extensions = self.IMG_EXTENSIONS
         self.samples = samples
-
         self.transform = transform
-        self.target_transform = target_transform
 
     def __getitem__(self, index):
-        path, target = self.samples[index]
-        sample = self.loader(path)
+        path = self.samples[index]
+        sample = cv2.imread(path)[..., ::-1]
         if self.transform is not None:
             sample = self.transform(sample)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        return sample, target
+        return sample
 
     def __len__(self):
         return len(self.samples)
@@ -62,17 +120,8 @@ class DatasetFolder(torch.utils.data.Dataset):
                   f'    Root Location: {self.root}\n'
         tmp = '    Transforms (if any): '
         trans_tmp = self.transform.__repr__().replace('\n', '\n' + ' ' * len(tmp))
-        fmt_str += f'{tmp}{trans_tmp}\n'
-        tmp = '    Target Transforms (if any): '
-        trans_tmp = self.target_transform.__repr__().replace('\n', '\n' + ' ' * len(tmp))
         fmt_str += f'{tmp}{trans_tmp}'
         return fmt_str
-
-    @staticmethod
-    def default_loader(path):
-        with open(path, 'rb') as f:
-            img = Image.open(f)
-            return img.convert('RGB')
 
 
 class CudaDataLoader:
