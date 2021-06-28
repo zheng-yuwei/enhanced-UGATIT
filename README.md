@@ -67,6 +67,9 @@
 [6] 人脸分割模型库：[zllrunning/face-parsing.PyTorch](https://github.com/zllrunning/face-parsing.PyTorch) ；
 
 
+------
+（以下为官方原始 readme 部分）
+
 ## U-GAT-IT &mdash; Official PyTorch Implementation
 ### : Unsupervised Generative Attentional Networks with Adaptive Layer-Instance Normalization for Image-to-Image Translation
 
