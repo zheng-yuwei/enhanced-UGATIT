@@ -1,5 +1,10 @@
 # enhanced-U-GAT-IT
 
+知乎上关于论文的解读blog：
+- [论文阅读 | 图像转换(五) AttentionGAN](https://zhuanlan.zhihu.com/p/168382844)
+- [论文阅读 | 图像转换(六) U-GAT-IT](https://zhuanlan.zhihu.com/p/270958248)
+专栏内及其他专栏有更多内容，欢迎进行技术讨论~
+
 基于官方U-GAT-IT[1]做改进：
 
 - 代码结构优化：
