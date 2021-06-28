@@ -3,9 +3,10 @@
 知乎上关于论文的解读blog：
 - [论文阅读 | 图像转换(五) AttentionGAN](https://zhuanlan.zhihu.com/p/168382844)
 - [论文阅读 | 图像转换(六) U-GAT-IT](https://zhuanlan.zhihu.com/p/270958248)
+
 专栏内及其他专栏有更多内容，欢迎进行技术讨论~
 
-基于官方U-GAT-IT[1]做改进：
+## 基于官方U-GAT-IT[1]做改进：
 
 - 代码结构优化：
   - 将`UGATIT.py`中的`train`函数的部分代码模块化为函数(`get_batch, forward, backward_G, backward_D`);
@@ -34,10 +35,11 @@
 ## 文件目录说明
 
 - `dataset`: 图像数据
-- `faceseg`: 人脸分割部分代码与明星权重文件夹
-- `videos`: 视频测试脚本
-- `scripts`: 运行脚本文件夹；
-- `dataset.py`: 数据集脚本；
+- `faceseg`: 人脸分割部分代码与明星权重文件夹；
+- `scripts`: 运行命令shell脚本文件夹；训练、测试的运行指令可以参考这里~
+- `videos`: 视频测试脚本；
+- `dataset.py`: 数据集；
+- `histogram.py`: 直方图匹配；
 - `main.py`: 程序主入口，配置信息；
 - `networks.py`: 生成器、判别器网络结构
 - `UGATIT.py`: 整个训练、测试过程的执行脚本；
