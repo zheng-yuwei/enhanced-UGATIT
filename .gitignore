@@ -130,4 +130,4 @@ dmypy.json
 
 # my ignore
 .idea
-
+.DS_Store

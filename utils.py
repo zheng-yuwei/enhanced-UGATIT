@@ -158,7 +158,7 @@ def generate_blur_images(root, save):
     :param root: 清晰图像所在的根目录
     :param save: 模糊图像存放的根目录
     """
-    print(f'generating blur images ...')
+    print(f'generating blur images: {root} to {save}...')
     file_list = os.listdir(root)
     if not os.path.isdir(save):
         os.makedirs(save)

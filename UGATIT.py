@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import time
+import copy
 import itertools
 from glob import glob
 
@@ -18,6 +19,7 @@ from networks import ResnetGenerator, Discriminator, RhoClipper, LIN, AdaLIN
 from utils import (AverageMeter, ProgressMeter, generate_blur_images,
                    RGB2BGR, tensor2numpy, attention_mask, cam, denorm)
 from dataset import MatchHistogramsDataset, DatasetFolder, get_loader
+from metrics import FIDScore
 
 
 class UGATIT(object):
@@ -64,8 +66,16 @@ class UGATIT(object):
               f'# resume : {self.args.resume}\n\n'
               )
         self.genA2B, self.genB2A = None, None
+        self.genA2B_ema, self.genB2A_ema = None, None
         self.disGA, self.disGB, self.disLA, self.disLB = None, None, None, None
         self.FaceSeg, self.fix_maskA, self.fix_maskB = None, None, None
+        self.trainA_data_root = os.path.join('dataset', self.args.dataset, 'trainA')
+        self.trainB_data_root = os.path.join('dataset', self.args.dataset, 'trainB')
+        self.testA_data_root = os.path.join('dataset', self.args.dataset, 'testA')
+        self.testB_data_root = os.path.join('dataset', self.args.dataset, 'testB')
+        self.blurA_data_root = os.path.join('dataset', self.args.dataset, 'blurA')
+        self.blurB_data_root = os.path.join('dataset', self.args.dataset, 'blurB')
+        self.train_transform, self.test_transform = None, None
         self.trainAB_loader, self.blurAB_loader = None, None
         self.trainAB_iter, self.blurAB_iter = None, None
         self.testA_loader, self.testB_loader = None, None
@@ -76,6 +86,8 @@ class UGATIT(object):
         self.G_adv_loss, self.G_cyc_loss, self.G_idt_loss, self.G_cam_loss = None, None, None, None
         self.Generator_loss, self.G_seg_loss = None, None
         self.discriminator_loss = None
+        self.fid_score, self.mean_std_A, self.mean_std_B = None, None, None
+        self.fid_loaderA, self.fid_loaderB = None, None
 
     ##################################################################################
     # Model
@@ -83,32 +95,33 @@ class UGATIT(object):
 
     def build_data_loader(self):
         """ 构造data loader """
-        train_transform = transforms.Compose([
+        self.train_transform = transforms.Compose([
             PIL.Image.fromarray,
             transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([
-                transforms.RandomResizedCrop(size=self.args.img_size, scale=(0.748, 1.0), ratio=(1.0, 1.0),
-                                             interpolation=PIL.Image.BICUBIC)], p=self.args.aug_prob),
-            transforms.Resize(size=self.args.img_size, interpolation=PIL.Image.BICUBIC),
+            transforms.RandomApply(
+                [transforms.RandomResizedCrop(size=self.args.img_size, scale=(0.748, 1.0), ratio=(1.0, 1.0),
+                                              interpolation=transforms.InterpolationMode.BICUBIC)],
+                p=self.args.aug_prob),
+            transforms.Resize(size=self.args.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
         ])
-        test_transform = transforms.Compose([
+        self.test_transform = transforms.Compose([
             PIL.Image.fromarray,
-            transforms.Resize((self.args.img_size, self.args.img_size), interpolation=PIL.Image.BICUBIC),
+            transforms.Resize((self.args.img_size, self.args.img_size),
+                              interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
         ])
 
-        trainAB = MatchHistogramsDataset((os.path.join('dataset', self.args.dataset, 'trainA'),
-                                          os.path.join('dataset', self.args.dataset, 'trainB')),
-                                         train_transform, is_match_histograms=self.args.match_histograms,
+        trainAB = MatchHistogramsDataset((self.trainA_data_root, self.trainB_data_root),
+                                         self.train_transform, is_match_histograms=self.args.match_histograms,
                                          match_mode=self.args.match_mode, b2a_prob=self.args.match_prob,
                                          match_ratio=self.args.match_ratio)
         self.trainAB_loader = get_loader(trainAB, self.args.device, batch_size=self.args.batch_size,
                                          shuffle=True, num_workers=self.args.num_workers)
-        testA = DatasetFolder(os.path.join('dataset', self.args.dataset, 'testA'), test_transform)
-        testB = DatasetFolder(os.path.join('dataset', self.args.dataset, 'testB'), test_transform)
+        testA = DatasetFolder(self.testA_data_root, self.test_transform)
+        testB = DatasetFolder(self.testB_data_root, self.test_transform)
         self.testA_loader = get_loader(testA, self.args.device, batch_size=1, shuffle=False,
                                        num_workers=self.args.num_workers)
         self.testB_loader = get_loader(testB, self.args.device, batch_size=1, shuffle=False,
@@ -116,15 +129,12 @@ class UGATIT(object):
 
         # 使用模糊图像增强判别器D对模糊的判别，从而增强生成器G生成清晰图像
         if self.args.has_blur:
-            blur_sub_dirA = os.path.join('dataset', self.args.dataset, 'blurA')
-            if not os.path.exists(blur_sub_dirA):
-                generate_blur_images(os.path.join('dataset', self.args.dataset, 'trainA'), blur_sub_dirA)
+            if not os.path.exists(self.blurA_data_root):
+                generate_blur_images(self.trainA_data_root, self.blurA_data_root)
+            if not os.path.exists(self.blurB_data_root):
+                generate_blur_images(self.trainB_data_root, self.blurB_data_root)
 
-            blur_sub_dirB = os.path.join('dataset', self.args.dataset, 'blurB')
-            if not os.path.exists(blur_sub_dirB):
-                generate_blur_images(os.path.join('dataset', self.args.dataset, 'trainB'), blur_sub_dirB)
-
-            blurAB = MatchHistogramsDataset((blur_sub_dirA, blur_sub_dirB), train_transform,
+            blurAB = MatchHistogramsDataset((self.blurA_data_root, self.blurB_data_root), self.train_transform,
                                             is_match_histograms=self.args.match_histograms,
                                             match_mode=self.args.match_mode, b2a_prob=self.args.match_prob,
                                             match_ratio=self.args.match_ratio)
@@ -139,12 +149,15 @@ class UGATIT(object):
                                       img_size=self.args.img_size, args=self.args).to(self.args.device)
         self.genB2A = ResnetGenerator(input_nc=3, output_nc=3, ngf=self.args.ch, n_blocks=self.args.n_res,
                                       img_size=self.args.img_size, args=self.args).to(self.args.device)
+        self.genA2B_ema = copy.deepcopy(self.genA2B).eval().requires_grad_(False)
+        self.genB2A_ema = copy.deepcopy(self.genB2A).eval().requires_grad_(False)
         self.disGA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=7, with_sn=self.args.sn).to(self.args.device)
         self.disGB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=7, with_sn=self.args.sn).to(self.args.device)
         self.disLA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=5, with_sn=self.args.sn).to(self.args.device)
         self.disLB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=5, with_sn=self.args.sn).to(self.args.device)
 
-        if self.args.seg_weight > 0:
+        # 使用分割区域做L2监督损失，或，分割出来的区域随机填充颜色的填充概率值
+        if self.args.seg_weight > 0 or self.args.seg_rand_mask > 0:
             self.FaceSeg = FaceSegmentation(self.args.device)
 
         # Define Loss
@@ -234,8 +247,8 @@ class UGATIT(object):
         fake_A2A, fake_A2A_cam_logit, fake_A2A_heatmap, fake_A2A_attention = self.genB2A(real_A)
         fake_B2B, fake_B2B_cam_logit, fake_B2B_heatmap, fake_B2B_attention = self.genA2B(real_B)
 
-        # 根据人脸分割，获取背景不变性损失项
-        if self.args.seg_weight > 0:
+        # 根据人脸分割，获取分割区域 self.fix_maskA (==1)
+        if self.args.seg_weight > 0 or self.args.seg_rand_mask > 0:
             tensorA = self.FaceSeg.face_segmentation(real_A)
             self.fix_maskA = self.FaceSeg.gen_mask(tensorA)  # 背景、眼睛、眼镜、嘴巴等的mask
             tensorB = self.FaceSeg.face_segmentation(real_B)
@@ -250,14 +263,18 @@ class UGATIT(object):
 
     def backward_D(self, real_A, real_B, fake_A2B, fake_B2A, blur=None):
         """ D网络前向+反向计算 """
-        if self.args.seg_weight > 0 and self.args.seg_rand_mask > 0:
-            if self.args.seg_rand_mask > np.random.rand():
-                rand_color = np.expand_dims(np.expand_dims((np.random.rand(3) * 2 - 1), -1), -1).astype(np.float32)
-                background_color = torch.ones_like(real_A) * rand_color
-                real_A = real_A * (1 - self.fix_maskA) + background_color * self.fix_maskA
-                fake_B2A = fake_B2A * (1 - self.fix_maskA) + background_color * self.fix_maskA
-                real_B = real_B * (1 - self.fix_maskB) + background_color * self.fix_maskB
-                fake_A2B = fake_A2B * (1 - self.fix_maskB) + background_color * self.fix_maskB
+        if self.args.seg_rand_mask > 0 and self.args.seg_rand_mask > np.random.rand():
+            rand_color = np.expand_dims(np.expand_dims((np.random.rand(3) * 2 - 1), -1), -1).astype(np.float32)
+            background_color = torch.ones_like(real_A) * torch.from_numpy(rand_color).to(self.args.device)
+            real_A = real_A * (1 - self.fix_maskA) + background_color * self.fix_maskA
+            fake_B2A = fake_B2A * (1 - self.fix_maskA) + background_color * self.fix_maskA
+            real_B = real_B * (1 - self.fix_maskB) + background_color * self.fix_maskB
+            fake_A2B = fake_A2B * (1 - self.fix_maskB) + background_color * self.fix_maskB
+            if blur is not None:
+                blur_A, blur_B = blur
+                blur_A = blur_A * (1 - self.fix_maskA) + background_color * self.fix_maskA
+                blur_B = blur_B * (1 - self.fix_maskB) + background_color * self.fix_maskB
+                blur = blur_A, blur_B
 
         real_GA_logit, real_GA_cam_logit, _ = self.disGA(real_A)
         real_LA_logit, real_LA_cam_logit, _ = self.disLA(real_A)
@@ -420,10 +437,6 @@ class UGATIT(object):
                G_ad_loss_B, G_recon_loss_B, G_identity_loss_B, G_cam_loss_B
 
     def train(self):
-        train_num = len(self.trainAB_loader)
-        train_counter = 0
-        epoch_counter = 0
-
         train_writer = SummaryWriter(os.path.join(self.args.result_dir, 'logs'))
         D_losses_A = AverageMeter('D_losses_A', ':.4e')
         D_losses_B = AverageMeter('D_losses_B', ':.4e')
@@ -459,7 +472,6 @@ class UGATIT(object):
 
         # training loop
         print('training start !')
-        self.gen_train(True)
         start_time = time.time()
         for step in range(start_iter, self.args.iteration + 1):
             if not self.args.no_decay_flag and step > mid_iter:
@@ -468,6 +480,7 @@ class UGATIT(object):
 
             real_A, real_B, blur = self.get_batch(mode='train')
 
+            self.gen_train(True)
             (fake_A2B, fake_A2B_cam_logit, _, _,
              fake_A2B2A, _, _,
              fake_B2A, fake_B2A_cam_logit, _, _,
@@ -504,133 +517,54 @@ class UGATIT(object):
             G_cam_losses_B.update(G_cam_loss_B.detach().cpu().item(), real_B.size(0))
             Generator_losses.update(self.Generator_loss.detach().cpu().item(), real_A.size(0))
 
-            train_counter += 1
-            if train_counter >= train_num:
-                train_progress.print(step)
-                train_writer.add_scalar('01_D_losses_A', D_losses_A.avg, epoch_counter)
-                train_writer.add_scalar('02_D_losses_B', D_losses_B.avg, epoch_counter)
-                train_writer.add_scalar('03_Discriminator_losses', Discriminator_losses.avg, epoch_counter)
-                train_writer.add_scalar('04_G_ad_losses_A', G_ad_losses_A.avg, epoch_counter)
-                train_writer.add_scalar('05_G_recon_losses_A', G_recon_losses_A.avg, epoch_counter)
-                train_writer.add_scalar('06_G_identity_losses_A', G_identity_losses_A.avg, epoch_counter)
-                train_writer.add_scalar('07_G_cam_losses_A', G_cam_losses_A.avg, epoch_counter)
-                train_writer.add_scalar('08_G_ad_losses_B', G_ad_losses_B.avg, epoch_counter)
-                train_writer.add_scalar('09_G_recon_losses_B', G_recon_losses_B.avg, epoch_counter)
-                train_writer.add_scalar('10_G_identity_losses_B', G_identity_losses_B.avg, epoch_counter)
-                train_writer.add_scalar('11_G_cam_losses_B', G_cam_losses_B.avg, epoch_counter)
-                train_writer.add_scalar('12_Generator_losses', Generator_losses.avg, epoch_counter)
-                train_writer.add_scalar('Learning rate', self.G_optim.param_groups[0]['lr'], epoch_counter)
+            # 可视化中间结果，计算fid，tensorboard统计
+            if step % self.args.print_freq == 0:
+                # 可视化中间结果
+                self.vis_inference_result(step, train_sample_num=5, test_sample_num=5)
+                if step > self.args.ema_start * self.args.iteration:
+                    temp = self.genA2B, self.genB2A
+                    self.genA2B, self.genB2A = self.genA2B_ema, self.genB2A_ema
+                    self.vis_inference_result(step, train_sample_num=5, test_sample_num=5, name='_ema')
+                    self.genA2B, self.genB2A = temp
+                # 计算fid
+                if step % self.args.calc_fid_freq == 0:
+                    temp_prefix = train_progress.prefix
+                    fid_score_A2B, fid_score_B2A = self.calc_fid_score()
+                    train_writer.add_scalar('13_fid_score_A2B', fid_score_A2B, step)
+                    train_writer.add_scalar('13_fid_score_B2A', fid_score_B2A, step)
+                    train_progress.prefix = f"Iteration: fid: A2B {fid_score_A2B:.4e}, B2A {fid_score_B2A:.4e}"
+                    if step > self.args.ema_start * self.args.iteration:
+                        temp = self.genA2B, self.genB2A
+                        self.genA2B, self.genB2A = self.genA2B_ema, self.genB2A_ema
+                        fid_score_A2B, fid_score_B2A = self.calc_fid_score()
+                        self.genA2B, self.genB2A = temp
+                        train_writer.add_scalar('14_fid_score_A2B_ema', fid_score_A2B, step)
+                        train_writer.add_scalar('14_fid_score_B2A_ema', fid_score_B2A, step)
+                        train_progress.prefix += f" A2B_ema {fid_score_A2B:.4e}, B2A_ema {fid_score_B2A:.4e}"
+                    train_progress.print(step)
+                    train_progress.prefix = temp_prefix
+                else:
+                    train_progress.print(step)
+
+                # 打印统计量
+                train_writer.add_scalar('01_D_losses_A', D_losses_A.avg, step)
+                train_writer.add_scalar('02_D_losses_B', D_losses_B.avg, step)
+                train_writer.add_scalar('03_Discriminator_losses', Discriminator_losses.avg, step)
+                train_writer.add_scalar('04_G_ad_losses_A', G_ad_losses_A.avg, step)
+                train_writer.add_scalar('05_G_recon_losses_A', G_recon_losses_A.avg, step)
+                train_writer.add_scalar('06_G_identity_losses_A', G_identity_losses_A.avg, step)
+                train_writer.add_scalar('07_G_cam_losses_A', G_cam_losses_A.avg, step)
+                train_writer.add_scalar('08_G_ad_losses_B', G_ad_losses_B.avg, step)
+                train_writer.add_scalar('09_G_recon_losses_B', G_recon_losses_B.avg, step)
+                train_writer.add_scalar('10_G_identity_losses_B', G_identity_losses_B.avg, step)
+                train_writer.add_scalar('11_G_cam_losses_B', G_cam_losses_B.avg, step)
+                train_writer.add_scalar('12_Generator_losses', Generator_losses.avg, step)
+                train_writer.add_scalar('Learning rate', self.G_optim.param_groups[0]['lr'], step)
                 train_writer.flush()
-                train_counter = 0
-                epoch_counter += 1
                 D_losses_A.reset(), D_losses_B.reset(), Discriminator_losses.reset()
                 G_ad_losses_A.reset(), G_recon_losses_A.reset(), G_identity_losses_A.reset()
                 G_cam_losses_A.reset(), G_ad_losses_B.reset(), G_recon_losses_B.reset()
                 G_identity_losses_B.reset(), G_cam_losses_B.reset(), Generator_losses.reset()
-
-            # clip parameter of AdaLIN and LIN, applied after optimizer step
-            self.genA2B.apply(self.Rho_LIN_clipper)
-            self.genB2A.apply(self.Rho_LIN_clipper)
-            self.genA2B.apply(self.Rho_AdaLIN_clipper)
-            self.genB2A.apply(self.Rho_AdaLIN_clipper)
-
-            info = f'[{step:5d}/{self.args.iteration:5d}] time: {(time.time() - start_time):4.4f} ' \
-                   f'd_loss: {self.discriminator_loss:.8f}, g_loss: {self.Generator_loss:.8f}, ' \
-                   f'g_adv: {self.G_adv_loss:.8f}, g_cyc: {self.G_cyc_loss:.8f}, ' \
-                   f'g_idt: {self.G_idt_loss:.8f}, g_cam: {self.G_cam_loss:.8f}'
-            if self.args.seg_weight > 0:
-                info += f', g_seg: {self.G_seg_loss:.8f}'
-            print(info)
-
-            # 可视化中间结果
-            if step % self.args.print_freq == 0:
-                train_sample_num = 5
-                test_sample_num = 5
-                A2B = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
-                B2A = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
-
-                self.gen_train(False), self.dis_train(False)
-                for _ in range(train_sample_num):
-                    real_A, real_B, _ = self.get_batch(mode='train')
-                    with torch.no_grad():
-                        (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
-                         fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
-                         fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
-                         fake_B2A2B, fake_B2A2B_heatmap, fake_B2A2B_attention,
-                         fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention,
-                         fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
-                            self.forward(real_A, real_B)
-
-                    A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
-                                cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
-                                cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
-                                cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
-                                ]
-                    if self.args.attention_gan > 0:
-                        for i in range(self.args.attention_gan):
-                            A2B_list.append(attention_mask(tensor2numpy(fake_A2B_attention[0][i:(i + 1)]),
-                                                           self.args.img_size))
-                    A2B = np.concatenate((A2B, np.concatenate(A2B_list, 0)), 1)
-
-                    B2A_list = [RGB2BGR(tensor2numpy(denorm(real_B[0]))),
-                                cam(tensor2numpy(fake_B2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
-                                cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
-                                cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
-                    if self.args.attention_gan > 0:
-                        for i in range(self.args.attention_gan):
-                            B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
-                                                           self.args.img_size))
-                    B2A = np.concatenate((B2A, np.concatenate(B2A_list, 0)), 1)
-
-                for _ in range(test_sample_num):
-                    real_A, real_B, _ = self.get_batch(mode='test')
-                    with torch.no_grad():
-                        (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
-                         fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
-                         fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
-                         fake_B2A2B, fake_B2A2B_heatmap, fake_B2A2B_attention,
-                         fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention,
-                         fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
-                            self.forward(real_A, real_B)
-
-                    A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
-                                cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
-                                cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
-                                cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
-                                ]
-                    if self.args.attention_gan > 0:
-                        for i in range(self.args.attention_gan):
-                            A2B_list.append(attention_mask(tensor2numpy(fake_A2B_attention[0][i:(i + 1)]),
-                                                           self.args.img_size))
-                    A2B = np.concatenate((A2B, np.concatenate(A2B_list, 0)), 1)
-
-                    B2A_list = [RGB2BGR(tensor2numpy(denorm(real_B[0]))),
-                                cam(tensor2numpy(fake_B2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
-                                cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
-                                cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
-                                RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
-                    if self.args.attention_gan > 0:
-                        for i in range(self.args.attention_gan):
-                            B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
-                                                           self.args.img_size))
-                    B2A = np.concatenate((B2A, np.concatenate(B2A_list, 0)), 1)
-
-                cv2.imwrite(os.path.join(self.args.result_dir, self.args.dataset, 'img', 'A2B_%07d.png' % step),
-                            A2B * 255.0)
-                cv2.imwrite(os.path.join(self.args.result_dir, self.args.dataset, 'img', 'B2A_%07d.png' % step),
-                            B2A * 255.0)
-                self.gen_train(True), self.dis_train(True)
 
             if step % self.args.save_freq == 0:
                 self.save(os.path.join(self.args.result_dir, self.args.dataset, 'model'), step)
@@ -639,26 +573,142 @@ class UGATIT(object):
                 self.save(self.args.result_dir, step=None, name='_params_latest.pt')
         train_writer.close()
 
-    def save(self, dir, step, name=None):
+    def calc_fid_score(self):
+        self.gen_train(False)
+        if self.fid_score is None:
+            self.fid_score = FIDScore(self.args.device, batch_size=self.args.fid_batch, num_workers=1)
+            self.mean_std_A = self.fid_score.calc_mean_std(self.trainA_data_root)
+            self.mean_std_B = self.fid_score.calc_mean_std(self.trainB_data_root)
+            self.fid_loaderA = get_loader(DatasetFolder(self.trainA_data_root, self.test_transform), self.args.device,
+                                          batch_size=self.args.fid_batch, shuffle=False,
+                                          num_workers=self.args.num_workers)
+            self.fid_loaderB = get_loader(DatasetFolder(self.trainB_data_root, self.test_transform), self.args.device,
+                                          batch_size=self.args.fid_batch, shuffle=False,
+                                          num_workers=self.args.num_workers)
+            self.fid_score.inception_model.normalize_input = False
+        mean_std_A2B = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genA2B(batch)[0].float(),
+                                                             self.fid_loaderA)
+        fid_score_A2B = self.fid_score.calc_fid(self.mean_std_B, mean_std_A2B)
+        mean_std_B2A = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genB2A(batch)[0].float(),
+                                                             self.fid_loaderB)
+        fid_score_B2A = self.fid_score.calc_fid(self.mean_std_A, mean_std_B2A)
+        return fid_score_A2B, fid_score_B2A
+
+    def vis_inference_result(self, step, train_sample_num=5, test_sample_num=5, name=''):
+        A2B = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
+        B2A = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
+        self.gen_train(False), self.dis_train(False)
+        for _ in range(train_sample_num):
+            real_A, real_B, _ = self.get_batch(mode='train')
+            with torch.no_grad(), autocast(enabled=False):
+                (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
+                 fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
+                 fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
+                 fake_B2A2B, fake_B2A2B_heatmap, fake_B2A2B_attention,
+                 fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention,
+                 fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
+                    self.forward(real_A, real_B)
+
+            A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
+                        cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
+                        cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
+                        cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
+                        ]
+            if self.args.attention_gan > 0:
+                for i in range(self.args.attention_gan):
+                    A2B_list.append(attention_mask(tensor2numpy(fake_A2B_attention[0][i:(i + 1)]),
+                                                   self.args.img_size))
+            A2B = np.concatenate((A2B, np.concatenate(A2B_list, 0)), 1)
+
+            B2A_list = [RGB2BGR(tensor2numpy(denorm(real_B[0]))),
+                        cam(tensor2numpy(fake_B2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
+                        cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
+                        cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
+            if self.args.attention_gan > 0:
+                for i in range(self.args.attention_gan):
+                    B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
+                                                   self.args.img_size))
+            B2A = np.concatenate((B2A, np.concatenate(B2A_list, 0)), 1)
+
+        for _ in range(test_sample_num):
+            real_A, real_B, _ = self.get_batch(mode='test')
+            with torch.no_grad(), autocast(enabled=False):
+                (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
+                 fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
+                 fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
+                 fake_B2A2B, fake_B2A2B_heatmap, fake_B2A2B_attention,
+                 fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention,
+                 fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
+                    self.forward(real_A, real_B)
+
+            A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
+                        cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
+                        cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
+                        cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
+                        ]
+            if self.args.attention_gan > 0:
+                for i in range(self.args.attention_gan):
+                    A2B_list.append(attention_mask(tensor2numpy(fake_A2B_attention[0][i:(i + 1)]),
+                                                   self.args.img_size))
+            A2B = np.concatenate((A2B, np.concatenate(A2B_list, 0)), 1)
+
+            B2A_list = [RGB2BGR(tensor2numpy(denorm(real_B[0]))),
+                        cam(tensor2numpy(fake_B2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2B[0]))),
+                        cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
+                        cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
+            if self.args.attention_gan > 0:
+                for i in range(self.args.attention_gan):
+                    B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
+                                                   self.args.img_size))
+            B2A = np.concatenate((B2A, np.concatenate(B2A_list, 0)), 1)
+
+        cv2.imwrite(os.path.join(self.args.result_dir, self.args.dataset, 'img', f'A2B{name}_{step:07d}.png'),
+                    A2B * 255.0)
+        cv2.imwrite(os.path.join(self.args.result_dir, self.args.dataset, 'img', f'B2A{name}_{step:07d}.png'),
+                    B2A * 255.0)
+        return
+
+    def model_ema(self, step, G_ema, G):
+        if step > self.args.ema_start * self.args.iteration:
+            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+                p_ema.copy_(p.lerp(p_ema, self.args.ema_beta))
+        else:
+            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+                p_ema.copy_(p_ema)
+        for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+            b_ema.copy_(b)
+        return
+
+    def save(self, root, step, name=None):
         if name is None:
             name = '_params_%07d.pt' % step
-        params = {}
-        params['genA2B'] = self.genA2B.state_dict()
-        params['genB2A'] = self.genB2A.state_dict()
-        params['disGA'] = self.disGA.state_dict()
-        params['disGB'] = self.disGB.state_dict()
-        params['disLA'] = self.disLA.state_dict()
-        params['disLB'] = self.disLB.state_dict()
-        torch.save(params, os.path.join(dir, self.args.dataset + name))
-        g_params = {}
-        g_params['genA2B'] = self.genA2B.state_dict()
-        torch.save(g_params, os.path.join(dir, self.args.dataset + f'_g{name}'))
+        params = {'genA2B': self.genA2B.state_dict(), 'genB2A': self.genB2A.state_dict(),
+                  'genA2B_ema': self.genA2B_ema.state_dict(), 'genB2A_ema': self.genB2A_ema.state_dict(),
+                  'disGA': self.disGA.state_dict(), 'disGB': self.disGB.state_dict(), 'disLA': self.disLA.state_dict(),
+                  'disLB': self.disLB.state_dict()}
+        torch.save(params, os.path.join(root, self.args.dataset + name))
+        g_params = {'genA2B': self.genA2B.state_dict(), 'genA2B_ema': self.genA2B_ema.state_dict()}
+        torch.save(g_params, os.path.join(root, self.args.dataset + f'_g{name}'))
 
-    def load(self, dir, step):
-        params = torch.load(os.path.join(dir, self.args.dataset + '_params_%07d.pt' % step),
+    def load(self, root, step):
+        params = torch.load(os.path.join(root, self.args.dataset + '_params_%07d.pt' % step),
                             map_location=torch.device("cpu"))
         self.genA2B.load_state_dict(params['genA2B'])
         self.genB2A.load_state_dict(params['genB2A'])
+        self.genA2B_ema.load_state_dict(params['genA2B_ema'])
+        self.genB2A_ema.load_state_dict(params['genB2A_ema'])
         self.disGA.load_state_dict(params['disGA'])
         self.disGB.load_state_dict(params['disGB'])
         self.disLA.load_state_dict(params['disLA'])
@@ -685,10 +735,10 @@ class UGATIT(object):
         self.genA2B.eval(), self.genB2A.eval()
         for n, (real_A, _) in enumerate(self.testA_loader):
             real_A = real_A.to(self.args.device)
-
-            fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention = self.genA2B(real_A)
-            fake_A2B2A, _, fake_A2B2A_heatmap, fake_A2B2A_attention = self.genB2A(fake_A2B)
-            fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention = self.genB2A(real_A)
+            with torch.no_grad():
+                fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention = self.genA2B(real_A)
+                fake_A2B2A, _, fake_A2B2A_heatmap, fake_A2B2A_attention = self.genB2A(fake_A2B)
+                fake_A2A, _, fake_A2A_heatmap, fake_A2A_attention = self.genB2A(real_A)
 
             A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                         cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
@@ -707,10 +757,10 @@ class UGATIT(object):
 
         for n, (real_B, _) in enumerate(self.testB_loader):
             real_B = real_B.to(self.args.device)
-
-            fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention = self.genB2A(real_B)
-            fake_B2A2B, _, fake_B2A2B_heatmap, fake_B2A2B_attention = self.genA2B(fake_B2A)
-            fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention = self.genA2B(real_B)
+            with torch.no_grad():
+                fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention = self.genB2A(real_B)
+                fake_B2A2B, _, fake_B2A2B_heatmap, fake_B2A2B_attention = self.genA2B(fake_B2A)
+                fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention = self.genA2B(real_B)
 
             B2A_list = [RGB2BGR(tensor2numpy(denorm(real_B[0]))),
                         cam(tensor2numpy(fake_B2B_heatmap[0]), self.args.img_size),

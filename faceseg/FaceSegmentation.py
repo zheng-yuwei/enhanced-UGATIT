@@ -33,11 +33,13 @@ class FaceSegmentation:
                                        map_location=torch.device('cpu')))
         net.eval()
         self.net = net
+        self.mean = torch.as_tensor((0.485, 0.456, 0.406), dtype=torch.float32, device=self.device).view(-1, 1, 1)
+        self.std = torch.as_tensor((0.229, 0.224, 0.225), dtype=torch.float32, device=self.device).view(-1, 1, 1)
         # 预处理
         self.preprocessor = transforms.Compose([
             lambda x: x * 0.5 + 0.5,
             functools.partial(F.interpolate, size=(512, 512), mode='bilinear', align_corners=True),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            lambda x: x.sub_(self.mean).div_(self.std),
         ])
 
     def face_segmentation(self, input_x):
@@ -53,11 +55,17 @@ class FaceSegmentation:
             mask = out.detach().argmax(1, keepdims=True)
         return mask
 
-    def gen_mask(self, mask_tensor, dilate_parts=(4, 5, 6, 11), erode_parts=(0, 14, 15, 16, 17, 18,)):
-        """ 根据指定的parts生成mask numpy数组 """
+    def gen_mask(self, mask_tensor, dilate_parts=(), erode_parts=(0, 14, 15, 16, 18,)):
+        """ 根据指定的parts生成mask numpy数组
+        :param mask_tensor: face parsing 分割出来的不同类别的mask
+        :param dilate_parts: 需要做膨胀操作的 前景类别列表
+        :param erode_parts: 需要做腐蚀操作的 前景类别列表，因为要把背景分割出来，所以这里默认列表包含 0: 'background'
+        :return mask: 前景mask
+        """
+        mask_tensor = mask_tensor.cpu().numpy()
         dilate_mask = np.zeros(mask_tensor.shape, dtype=np.float32)
         erode_mask = np.zeros(mask_tensor.shape, dtype=np.float32)
-        mask = torch.ones_like(mask_tensor, dtype=torch.float32)
+        mask = np.ones_like(mask_tensor, dtype=np.float32)
         for i in dilate_parts:
             dilate_mask[mask_tensor == i] = 1
         for i in erode_parts:
@@ -70,11 +78,16 @@ class FaceSegmentation:
         for i in range(len(erode_mask)):
             erode_mask[i, 0] = cv2.morphologyEx(erode_mask[i, 0], cv2.MORPH_CLOSE, self.kernel)
             erode_mask[i, 0] = cv2.erode(erode_mask[i, 0], self.kernel, iterations=1)
-        mask = mask * (1 - (1 - dilate_mask) * (1 - erode_mask))
+        mask = torch.from_numpy(mask * (1 - (1 - dilate_mask) * (1 - erode_mask))).to(self.device)
         return mask
 
     def vis(self, image, mask, is_show=False):
-        """ 可视化人脸分割结果 """
+        """ 可视化人脸分割结果，如果mask包含不同类别，会将不同类别用不同的颜色mask可视化，如果只有一种类别，会将前景用蓝色mask可视化
+        :param image: 待可视化图像
+        :param mask: 待可视化图像分割后的mask
+        :param is_show:是否用cv2.imshow可视化
+        :return 可视化的图像
+        """
         vis_im = (image.numpy().transpose(1, 2, 0) * 127.5 + 127.5).astype(np.uint8)
         vis_mask = mask.numpy().astype(np.uint8)
         vis_mask_color = np.zeros((vis_mask.shape[0], vis_mask.shape[1], 3)) + 255
@@ -88,11 +101,11 @@ class FaceSegmentation:
             vis_mask_color[index[0], index[1], :] = self.part_colors[1]
 
         vis_mask_color = vis_mask_color.astype(np.uint8)
-        vis_im = cv2.addWeighted(cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR), 0.4, vis_mask_color, 0.6, 0)
+        vis_im_hm = cv2.addWeighted(cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR), 0.5, vis_mask_color, 0.5, 0)
         if is_show:
-            cv2.imshow('seg', vis_im)
+            cv2.imshow('seg', np.concatenate([vis_im_hm, cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR)], axis=1))
             cv2.waitKey(0)
-        return vis_im
+        return np.concatenate([vis_im_hm, cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR)], axis=1)
 
 
 if __name__ == '__main__':
@@ -110,4 +123,5 @@ if __name__ == '__main__':
         test_img = train_transform(os.path.join(img_dir, f_name))
         test_mask = face_seg.face_segmentation(test_img)
         test_mask = face_seg.gen_mask(test_mask)  # 注释这句可以看到所有类别
-        face_seg.vis(test_img[0], test_mask[0, 0], is_show=True)
+        vis_img = face_seg.vis(test_img[0], test_mask[0, 0], is_show=True)
+        cv2.imwrite(f_name, vis_img)

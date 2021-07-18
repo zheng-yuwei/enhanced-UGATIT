@@ -16,8 +16,8 @@ def get_loader(my_dataset, device, batch_size, num_workers, shuffle):
     """ 根据dataset及设置，获取对应的 DataLoader """
     my_loader = torch.utils.data.DataLoader(my_dataset, batch_size=batch_size, num_workers=num_workers,
                                             shuffle=shuffle, pin_memory=True, persistent_workers=(num_workers > 0))
-    if torch.cuda.is_available():
-        my_loader = CudaDataLoader(my_loader, device=device)
+    # if torch.cuda.is_available():
+    #     my_loader = CudaDataLoader(my_loader, device=device)
     return my_loader
 
 
@@ -44,7 +44,7 @@ class MatchHistogramsDataset(torch.utils.data.Dataset):
         self.match_ratio = match_ratio
 
     def __getitem__(self, index):
-        sample_0 = self.dataset_0[index] if index < self.len_0 else self.dataset_1[np.random.randint(self.len_0)]
+        sample_0 = self.dataset_0[index] if index < self.len_0 else self.dataset_0[np.random.randint(self.len_0)]
         sample_1 = self.dataset_1[index] if index < self.len_1 else self.dataset_1[np.random.randint(self.len_1)]
 
         if self.is_match_histograms:

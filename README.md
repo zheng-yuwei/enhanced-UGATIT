@@ -6,36 +6,57 @@
 
 专栏内及其他专栏有更多内容，欢迎进行技术讨论~
 
+## Usage
+
+```shell
+CUDA_VISIBLE_DEVICES=2 python main.py --dataset YOUR_DATASET_NAME --light 32 --result_dir YOUR_RESULT_DIR \
+--img_size 384 --aug_prob 0.2 --device cuda:0 --num_worker 1 --print_freq 1000 --calc_fid_freq 10000 --save_freq 100000 \
+--ema_start 0.5 --ema_beta 0.9999 -adv_weight 1.0 --forward_adv_weight 1 --cycle_weight 10 --identity_weight 10 \
+--seg_weight 50 --seg_rand_mask 0.8 --attention_gan 3 --attention_input --has_blur --use_se
+```
+
+本地调试的话：`--device cuda:0` -> `--device cpu`，
+
 ## 基于官方U-GAT-IT[1]做改进：
 
 - 代码结构优化：
   - 将`UGATIT.py`中的`train`函数的部分代码模块化为函数(`get_batch, forward, backward_G, backward_D`);
   - 增加训练时损失函数的打印，tensorboard记录；
-  - 优化了官方代码中一次多余的前向推理，约节省20%的训练时间。
+  - 优化了官方代码中一次多余的前向推理，约节省20%的训练时间；
+  - 混合精度训练，速度提升约 30~40%，显存也节约很多。
   
 - 功能增强（可选是否开启）：
+  - `--ema_start`: 开始做模型ema的迭代次数的比例数，也就是`--iteration 100 --ema_start 0.7`表示 `100 * 0.7 = 70` 个迭代后开始做模型ema；
+  - `--ema_beta`: 模型ema的滑动平均系数；
+  - `--calc_fid_freq`: 计算fid score的频率，应该设置为`--print_freq`的整数倍；
+  - `--fid_batch`: 每次计算fid score时，推理时使用的`batch size`；
+  - `--adv_weight, forward_adv_weight, backward_adv_weight`: 将对抗损失项权重分成3个（原始的对抗损失项权重，A2B对抗损失项的权重，B2A的对抗损失项权重）；
   - `--aug_prob`: 数据增强`RandomResizedCrop`的概率；
-  - `--adv_weight, forward_adv_weight, backward_adv_weight`: 将对抗损失项权重分成3个（原始的对抗损失项权重，A2B对抗损失项的权重，B2A的对抗损失项权重）。
-  - `--use_se`: 在生成网络中，是否给每个`ResnetBlock, ResnetAdaILNBlock`增加`scse block`；[2]
-  - `--attention_gan`: 生成网络中，是否使用`attention mask`机制（在上采样前多一个分支，用于生成mask）；[3]
-  - `--use_deconv`: 生成网络中，上采样是否使用反卷积`nn.ConvTranspose2d`，默认使用插值+卷积方式；
-  - `--sn`: 判别器中，卷积操作后是否进行谱归一化，默认使用，tf官方代码有，pt官方代码没有；
-  - `--match_histograms`：是否将两个域进行直方图匹配，使两个域的分布一致；[4]
+  - `--match_histograms`：是否将两个域进行直方图匹配，使两个域的分布一致；[2]
   - `--match_mode`：直方图匹配时的匹配模式，(hsv, hsl, rgb)中的一个；
   - `--match_prob`：将域B的图像往域A进行直方图匹配的概率，否则将域A的图像往域B直方图匹配；
   - `--match_ratio`：直方图匹配的比例，匹配图 * ratio + 原图 * （1 - ratio）；
-  - `--has_blur`: 判别网络训练/模型更新时，损失项中增加模糊对抗损失项，增强D对模糊图片的判别；[5]
-  - `--seg_weight`: 人脸分割[6]损失权重，1. 将原图与生成图在指定/背景区域上做L1损失；2. 生成图的背景区域detach掉再放入D网络做对抗；3. 背景区域的对抗损失置0；4. 背景区域的判别损失置0；
+  - `--sn`: 判别器中，卷积操作后是否进行谱归一化，默认使用，tf官方代码有，pt官方代码没有；
+  - `--has_blur`: 判别网络训练/模型更新时，损失项中增加模糊对抗损失项，增强D对模糊图片的判别；[3]
+  - `--use_se`: 在生成网络中，是否给每个`ResnetBlock, ResnetAdaILNBlock`增加`scse block`；[4]
+  - `--attention_gan`: 生成网络中，是否使用`attention mask`机制（在上采样前多一个分支，用于生成mask）；[5]
+  - `--use_deconv`: 生成网络中，上采样是否使用反卷积`nn.ConvTranspose2d`，默认使用插值+卷积方式；
+  - `--seg_weight`: 人脸分割[6]损失权重（本库代码默认的分割区域为下图的二分类图，借鉴的库可实现多个类别的解析），
+  1. 将原图与生成图在背景区域上做L1损失；2. 生成图的背景区域detach掉再放入D网络做对抗；3. 背景区域的对抗损失置0；4. 背景区域的判别损失置0；
   - `--seg_rand_mask`: 配合分割权重一起用，5. 训练D网络时，整个背景替换为某一个随机值的随机概率。
     `--seg_weight` 和 `--seg_rand_mask` 的目的是：G对背景是单位映射（1） + 让D不影响G的背景（2，3） + 让D不依赖背景做判断（4，5），从而使得整个训练过程和尽量背景无关。
-  
+
+![背景分割](./assets/bg_parsing_boy.png) ![人脸解析](./assets/face_parsing_boy.png)
+
 - 其他功能：
   - `--phase`: 模型的视频/摄像头/图片文件夹测试（`video | camera | img_dir`），图片文件测试（`test`）；
 
 ## 文件目录说明
 
+- `assets`： `README.md`中的图像；
 - `dataset`: 图像数据
 - `faceseg`: 人脸分割部分代码与明星权重文件夹；
+- `metrics`: FID score 计算脚本；
 - `scripts`: 运行命令shell脚本文件夹；训练、测试的运行指令可以参考这里~
 - `videos`: 视频测试脚本；
 - `dataset.py`: 数据集；
@@ -60,10 +81,10 @@
 ## reference
 
 [1] UGATIT官方pytorch实现，也是本库baseline：https://github.com/znxlwm/UGATIT-pytorch;  
-[2] Concurrent Spatial and Channel ‘Squeeze & Excitation’ in Fully Convolutional Networks;  
-[3] AttentionGAN: Unpaired Image-to-Image Translation using Attention-Guided Generative Adversarial Networks;  
-[4] 直方图匹配参考 [Bringing-Old-Photos-Back-to-Life](https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life) ；  
-[5] CartoonGAN: Generative Adversarial Networks for Photo Cartoonization;  
+[2] 直方图匹配参考 [Bringing-Old-Photos-Back-to-Life](https://github.com/microsoft/Bringing-Old-Photos-Back-to-Life) ； 
+[3] CartoonGAN: Generative Adversarial Networks for Photo Cartoonization;  
+[4] Concurrent Spatial and Channel ‘Squeeze & Excitation’ in Fully Convolutional Networks;  
+[5] AttentionGAN: Unpaired Image-to-Image Translation using Attention-Guided Generative Adversarial Networks;   
 [6] 人脸分割模型库：[zllrunning/face-parsing.PyTorch](https://github.com/zllrunning/face-parsing.PyTorch) ；
 
 
@@ -119,28 +140,18 @@ The results of the paper came from the **Tensorflow code**
 ```
 
 ## Architecture
-<div align="center">
-  <img src = './assets/generator.png' width = '785px' height = '500px'>
-</div>
+![generator](./assets/generator.png)
 
 ---
 
-<div align="center">
-  <img src = './assets/discriminator.png' width = '785px' height = '450px'>
-</div>
+![discriminator](./assets/discriminator.png)
 
 ## Results
 ### Ablation study
-<div align="center">
-  <img src = './assets/ablation.png' width = '438px' height = '346px'>
-</div>
+![Ablation study](./assets/ablation.png)
 
 ### User study
-<div align="center">
-  <img src = './assets/user_study.png' width = '738px' height = '187px'>
-</div>
+![User study](./assets/user_study.png)
 
 ### Comparison
-<div align="center">
-  <img src = './assets/kid.png' width = '787px' height = '344px'>
-</div>
+![KID score](./assets/kid.png)

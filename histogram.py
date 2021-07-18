@@ -112,7 +112,6 @@ def calculate_lookup(src_cdf: np.ndarray, ref_cdf: np.ndarray) -> np.ndarray:
 
 
 if __name__ == '__main__':
-    import cv2
     import numpy as np
 
     kid_src = cv2.imread('dataset/kid_src.png')
