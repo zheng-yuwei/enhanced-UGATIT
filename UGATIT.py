@@ -4,19 +4,20 @@ import time
 import copy
 import itertools
 from glob import glob
+from typing import Union
 
 import cv2
 import PIL
 import numpy as np
+from tqdm import tqdm
 import torch
 from torch import nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
 from faceseg.FaceSegmentation import FaceSegmentation
-from networks import ResnetGenerator, Discriminator, RhoClipper, LIN, AdaLIN
-from utils import (AverageMeter, ProgressMeter, generate_blur_images,
+from utils import (calc_tv_loss, AverageMeter, ProgressMeter, generate_blur_images,
                    RGB2BGR, tensor2numpy, attention_mask, cam, denorm)
 from dataset import MatchHistogramsDataset, DatasetFolder, get_loader
 from metrics import FIDScore
@@ -36,24 +37,28 @@ class UGATIT(object):
               f'# dataset : {self.args.dataset}\n'
               f'# batch_size : {self.args.batch_size}\n'
               f'# num_workers : {self.args.num_workers}\n'
-              f'# aug_prob : {self.args.aug_prob}\n'
-              f'# iteration : {self.args.iteration}\n\n'
-              f'##### Generator #####\n'
-              f'# residual blocks : {self.args.n_res}\n'
+              f'# ema_start : {self.args.ema_start}\n'
+              f'# ema_beta : {self.args.ema_beta}\n'
+              f'# iteration : {self.args.iteration}\n'
+              f'# is decay : {self.args.no_decay_flag}\n'
+              f'##### Data #####\n'
               f'# img_size : {self.args.img_size}\n'
               f'# aug_prob : {self.args.aug_prob}\n'
               f'# match_histograms : {self.args.match_histograms}\n'
               f'# match_mode : {self.args.match_mode}\n'
               f'# match_prob : {self.args.match_prob}\n'
               f'# match_ratio : {self.args.match_ratio}\n'
+              f'##### Generator #####\n'
+              f'# residual blocks : {self.args.n_res}\n'
               f'# use se or not : {self.args.use_se}\n'
               f'# use blur or not : {self.args.has_blur}\n'
-              f'# use deconv or not : {self.args.use_deconv}\n'
+              f'# tv_loss : {self.args.tv_loss}\n'
+              f'# tv_weight : {self.args.tv_weight}\n'
               f'# use attention gan : {self.args.attention_gan}\n'
-              f'# use attention input : {self.args.attention_input}\n\n'
+              f'# use attention input : {self.args.attention_input}\n'
               f'##### Discriminator #####\n'
-              f'# discriminator layer : {self.args.n_dis}\n'
-              f'# use sn : {self.args.sn}\n\n'
+              f'# global discriminator layer : {self.args.n_global_dis}\n'
+              f'# local discriminator layer : {self.args.n_local_dis}\n'
               f'##### Weight #####\n'
               f'# adv_weight : {self.args.adv_weight}\n'
               f'# forward_adv_weight : {self.args.forward_adv_weight}\n'
@@ -61,14 +66,28 @@ class UGATIT(object):
               f'# cycle_weight : {self.args.cycle_weight}\n'
               f'# identity_weight : {self.args.identity_weight}\n'
               f'# cam_weight : {self.args.cam_weight}\n'
-              f'# seg_weight : {self.args.seg_weight}\n'
-              f'# seg_rand_mask : {self.args.seg_rand_mask}\n'
+              f'##### Enhanced #####\n'
+              f'# cam_D_weight : {self.args.cam_D_weight}\n'
+              f'# cam_D_attention : {self.args.cam_D_attention}\n'
+              f'##### Segment #####\n'
+              f'# hard_seg_edge : {self.args.hard_seg_edge}\n'
+              f'# seg_fix_weight : {self.args.seg_fix_weight}\n'
+              f'# seg_fix_glass_mouth : {self.args.seg_fix_glass_mouth}\n'
+              f'# seg_D_mask : {self.args.seg_D_mask}\n'
+              f'# seg_G_detach : {self.args.seg_G_detach}\n'
+              f'# seg_D_cam_fea_mask : {self.args.seg_D_cam_fea_mask}\n'
+              f'# seg_D_cam_inp_mask : {self.args.seg_D_cam_inp_mask}\n'
               f'# resume : {self.args.resume}\n\n'
               )
+
+        self.use_seg = ((self.args.seg_fix_weight > 0) or self.args.seg_D_mask or self.args.seg_G_detach or
+                        self.args.seg_D_cam_fea_mask or self.args.seg_D_cam_inp_mask)
+
         self.genA2B, self.genB2A = None, None
         self.genA2B_ema, self.genB2A_ema = None, None
         self.disGA, self.disGB, self.disLA, self.disLB = None, None, None, None
-        self.FaceSeg, self.fix_maskA, self.fix_maskB = None, None, None
+        self.FaceSeg = None
+        self.maskA, self.maskA_erode, self.maskB, self.maskB_erode = None, None, None, None
         self.trainA_data_root = os.path.join('dataset', self.args.dataset, 'trainA')
         self.trainB_data_root = os.path.join('dataset', self.args.dataset, 'trainB')
         self.testA_data_root = os.path.join('dataset', self.args.dataset, 'testA')
@@ -84,7 +103,7 @@ class UGATIT(object):
         self.G_optim, self.D_optim = None, None
         self.Rho_LIN_clipper, self.Rho_AdaLIN_clipper = None, None
         self.G_adv_loss, self.G_cyc_loss, self.G_idt_loss, self.G_cam_loss = None, None, None, None
-        self.Generator_loss, self.G_seg_loss = None, None
+        self.Generator_loss, self.G_seg_loss, self.tv_loss = None, None, None
         self.discriminator_loss = None
         self.fid_score, self.mean_std_A, self.mean_std_B = None, None, None
         self.fid_loaderA, self.fid_loaderB = None, None
@@ -143,6 +162,7 @@ class UGATIT(object):
 
     def build_model(self):
         """ 构造data loader，Generator，Discriminator 模型，损失，优化器 """
+        from networks import ResnetGenerator, Discriminator, RhoClipper, LIN, AdaLIN
         self.build_data_loader()
         # Define Generator, Discriminator
         self.genA2B = ResnetGenerator(input_nc=3, output_nc=3, ngf=self.args.ch, n_blocks=self.args.n_res,
@@ -151,13 +171,17 @@ class UGATIT(object):
                                       img_size=self.args.img_size, args=self.args).to(self.args.device)
         self.genA2B_ema = copy.deepcopy(self.genA2B).eval().requires_grad_(False)
         self.genB2A_ema = copy.deepcopy(self.genB2A).eval().requires_grad_(False)
-        self.disGA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=7, with_sn=self.args.sn).to(self.args.device)
-        self.disGB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=7, with_sn=self.args.sn).to(self.args.device)
-        self.disLA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=5, with_sn=self.args.sn).to(self.args.device)
-        self.disLB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=5, with_sn=self.args.sn).to(self.args.device)
+        self.disGA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=self.args.n_global_dis, with_sn=self.args.sn,
+                                   use_cam_attention=self.args.cam_D_attention).to(self.args.device)
+        self.disGB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=self.args.n_global_dis, with_sn=self.args.sn,
+                                   use_cam_attention=self.args.cam_D_attention).to(self.args.device)
+        self.disLA = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=self.args.n_local_dis, with_sn=self.args.sn,
+                                   use_cam_attention=self.args.cam_D_attention).to(self.args.device)
+        self.disLB = Discriminator(input_nc=3, ndf=self.args.ch, n_layers=self.args.n_local_dis, with_sn=self.args.sn,
+                                   use_cam_attention=self.args.cam_D_attention).to(self.args.device)
 
         # 使用分割区域做L2监督损失，或，分割出来的区域随机填充颜色的填充概率值
-        if self.args.seg_weight > 0 or self.args.seg_rand_mask > 0:
+        if self.use_seg:
             self.FaceSeg = FaceSegmentation(self.args.device)
 
         # Define Loss
@@ -201,32 +225,32 @@ class UGATIT(object):
         """ 获取训练数据 """
         if mode == 'train':
             try:
-                real_A, real_B = self.trainAB_iter.next()
-            except:
+                real_A, real_B = next(self.trainAB_iter)
+            except (StopIteration, TypeError):
                 self.trainAB_iter = iter(self.trainAB_loader)
-                real_A, real_B = self.trainAB_iter.next()
+                real_A, real_B = next(self.trainAB_iter)
         else:
             try:
-                real_A = self.testA_iter.next()
-            except:
+                real_A = next(self.testA_iter)
+            except (StopIteration, TypeError):
                 self.testA_iter = iter(self.testA_loader)
-                real_A = self.testA_iter.next()
+                real_A = next(self.testA_iter)
 
             try:
-                real_B = self.testB_iter.next()
-            except:
+                real_B = next(self.testB_iter)
+            except (StopIteration, TypeError):
                 self.testB_iter = iter(self.testB_loader)
-                real_B = self.testB_iter.next()
+                real_B = next(self.testB_iter)
 
         real_A, real_B = real_A.to(self.args.device, non_blocking=True), real_B.to(self.args.device, non_blocking=True)
 
         blur = None
         if self.args.has_blur and mode == 'train':
             try:
-                blur_A, blur_B = self.blurAB_iter.next()
-            except:
+                blur_A, blur_B = next(self.blurAB_iter)
+            except (StopIteration, TypeError):
                 self.blurAB_iter = iter(self.blurAB_loader)
-                blur_A, blur_B = self.blurAB_iter.next()
+                blur_A, blur_B = next(self.blurAB_iter)
 
             blur = (blur_A.to(self.args.device, non_blocking=True), blur_B.to(self.args.device, non_blocking=True))
 
@@ -247,12 +271,32 @@ class UGATIT(object):
         fake_A2A, fake_A2A_cam_logit, fake_A2A_heatmap, fake_A2A_attention = self.genB2A(real_A)
         fake_B2B, fake_B2B_cam_logit, fake_B2B_heatmap, fake_B2B_attention = self.genA2B(real_B)
 
-        # 根据人脸分割，获取分割区域 self.fix_maskA (==1)
-        if self.args.seg_weight > 0 or self.args.seg_rand_mask > 0:
-            tensorA = self.FaceSeg.face_segmentation(real_A)
-            self.fix_maskA = self.FaceSeg.gen_mask(tensorA)  # 背景、眼睛、眼镜、嘴巴等的mask
-            tensorB = self.FaceSeg.face_segmentation(real_B)
-            self.fix_maskB = self.FaceSeg.gen_mask(tensorB)
+        # 根据人脸分割，获取分割区域 self.maskA (==1)
+        if self.use_seg:
+            maskA = self.FaceSeg.face_segmentation(real_A)
+            self.maskA = self.FaceSeg.gen_mask(maskA, is_soft_edge=self.args.hard_seg_edge,
+                                               normal_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17),
+                                               dilate_parts=(), erode_parts=())
+            self.maskA_erode = self.FaceSeg.gen_mask(maskA, normal_parts=(), dilate_parts=(),
+                                                     is_soft_edge=self.args.hard_seg_edge,
+                                                     erode_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17))
+            if self.args.seg_fix_glass_mouth:
+                maskA_erode = self.FaceSeg.gen_mask(maskA, normal_parts=(1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 17),
+                                                    dilate_parts=(), is_soft_edge=self.args.hard_seg_edge,
+                                                    erode_parts=(6, ))
+                self.maskA_erode *= maskA_erode
+            maskB = self.FaceSeg.face_segmentation(real_B)
+            self.maskB = self.FaceSeg.gen_mask(maskB, is_soft_edge=self.args.hard_seg_edge,
+                                               normal_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17),
+                                               dilate_parts=(), erode_parts=())
+            self.maskB_erode = self.FaceSeg.gen_mask(maskB, normal_parts=(), dilate_parts=(),
+                                                     is_soft_edge=self.args.hard_seg_edge,
+                                                     erode_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17))
+            if self.args.seg_fix_glass_mouth:
+                maskB_erode = self.FaceSeg.gen_mask(maskB, normal_parts=(1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 17),
+                                                    dilate_parts=(), is_soft_edge=self.args.hard_seg_edge,
+                                                    erode_parts=(6, ))
+                self.maskB_erode *= maskB_erode
 
         return (fake_A2B, fake_A2B_cam_logit, fake_A2B_heatmap, fake_A2B_attention,
                 fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
@@ -261,30 +305,30 @@ class UGATIT(object):
                 fake_A2A, fake_A2A_cam_logit, fake_A2A_heatmap, fake_A2A_attention,
                 fake_B2B, fake_B2B_cam_logit, fake_B2B_heatmap, fake_B2B_attention)
 
-    def backward_D(self, real_A, real_B, fake_A2B, fake_B2A, blur=None):
+    def backward_D(self, real_A, real_B, fake_A2B, fake_B2A, blur=None):  # noqa
         """ D网络前向+反向计算 """
-        if self.args.seg_rand_mask > 0 and self.args.seg_rand_mask > np.random.rand():
-            rand_color = np.expand_dims(np.expand_dims((np.random.rand(3) * 2 - 1), -1), -1).astype(np.float32)
-            background_color = torch.ones_like(real_A) * torch.from_numpy(rand_color).to(self.args.device)
-            real_A = real_A * (1 - self.fix_maskA) + background_color * self.fix_maskA
-            fake_B2A = fake_B2A * (1 - self.fix_maskA) + background_color * self.fix_maskA
-            real_B = real_B * (1 - self.fix_maskB) + background_color * self.fix_maskB
-            fake_A2B = fake_A2B * (1 - self.fix_maskB) + background_color * self.fix_maskB
-            if blur is not None:
-                blur_A, blur_B = blur
-                blur_A = blur_A * (1 - self.fix_maskA) + background_color * self.fix_maskA
-                blur_B = blur_B * (1 - self.fix_maskB) + background_color * self.fix_maskB
-                blur = blur_A, blur_B
+        fake_A2B, fake_B2A = fake_A2B.detach(), fake_B2A.detach()
+        # 将生成图像的分割区域（膨胀）随机填充颜色，用于后续D训练的cam
+        cam_real_A, cam_fake_A2B, cam_real_B, cam_fake_B2A = None, None, None, None
+        if self.args.seg_D_cam_inp_mask:
+            cam_real_A = self.maskA * real_A
+            cam_fake_A2B = self.maskA * fake_A2B
+            cam_real_B = self.maskB * real_B
+            cam_fake_B2A = self.maskB * fake_B2A
 
-        real_GA_logit, real_GA_cam_logit, _ = self.disGA(real_A)
-        real_LA_logit, real_LA_cam_logit, _ = self.disLA(real_A)
-        fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A.detach())
-        fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A.detach())
+        maskA, maskB = None, None
+        if self.args.seg_D_cam_fea_mask:
+            maskA, maskB = self.maskA, self.maskB
 
-        real_GB_logit, real_GB_cam_logit, _ = self.disGB(real_B)
-        real_LB_logit, real_LB_cam_logit, _ = self.disLB(real_B)
-        fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B.detach())
-        fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B.detach())
+        real_GA_logit, real_GA_cam_logit, _ = self.disGA(real_A, cam_real_A, maskA)
+        real_LA_logit, real_LA_cam_logit, _ = self.disLA(real_A, cam_real_A, maskA)
+        fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A, cam_fake_B2A, maskB)
+        fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A, cam_fake_B2A, maskB)
+
+        real_GB_logit, real_GB_cam_logit, _ = self.disGB(real_B, cam_real_B, maskB)
+        real_LB_logit, real_LB_cam_logit, _ = self.disLB(real_B, cam_real_B, maskB)
+        fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B, cam_fake_A2B, maskA)
+        fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B, cam_fake_A2B, maskA)
 
         # 设置目标常量，GA和LA的D网络输出shape不一致，但cam的分类输出是一致的
         flag_GA_1 = torch.ones_like(real_GA_logit, requires_grad=False).to(self.args.device)
@@ -294,21 +338,6 @@ class UGATIT(object):
         flag_cam_1 = torch.ones_like(real_GA_cam_logit, requires_grad=False).to(self.args.device)
         flag_cam_0 = torch.zeros_like(fake_GA_cam_logit, requires_grad=False).to(self.args.device)
 
-        # 背景区域不需要判别损失，置为目标值，相当于把背景区域的判别损失置0
-        if self.args.seg_weight > 0:
-            fix_maskA_G = F.interpolate(self.fix_maskA, fake_GA_logit.shape[2:], mode='area')
-            fix_maskA_L = F.interpolate(self.fix_maskA, fake_LA_logit.shape[2:], mode='area')
-            real_GA_logit = real_GA_logit * (1 - fix_maskA_G) + flag_GA_1 * fix_maskA_G
-            real_LA_logit = real_LA_logit * (1 - fix_maskA_L) + flag_LA_1 * fix_maskA_L
-            fake_GA_logit = fake_GA_logit * (1 - fix_maskA_G) + flag_GA_0 * fix_maskA_G
-            fake_LA_logit = fake_LA_logit * (1 - fix_maskA_L) + flag_LA_0 * fix_maskA_L
-            fix_maskB_G = F.interpolate(self.fix_maskB, fake_GB_logit.shape[2:], mode='area')
-            fix_maskB_L = F.interpolate(self.fix_maskB, fake_LB_logit.shape[2:], mode='area')
-            real_GB_logit = real_GB_logit * (1 - fix_maskB_G) + flag_GA_1 * fix_maskB_G
-            real_LB_logit = real_LB_logit * (1 - fix_maskB_L) + flag_LA_1 * fix_maskB_L
-            fake_GB_logit = fake_GB_logit * (1 - fix_maskB_G) + flag_GA_0 * fix_maskB_G
-            fake_LB_logit = fake_LB_logit * (1 - fix_maskB_L) + flag_LA_0 * fix_maskB_L
-
         # D网络损失函数：cam和D网络损失
         D_loss_GA, D_cam_loss_GA = 0, 0
         D_loss_LA, D_cam_loss_LA = 0, 0
@@ -316,99 +345,135 @@ class UGATIT(object):
         D_loss_LB, D_cam_loss_LB = 0, 0
         if blur is not None:
             blur_A, blur_B = blur
-            blur_GA_logit, blur_GA_cam_logit, _ = self.disGA(blur_A)
-            blur_LA_logit, blur_LA_cam_logit, _ = self.disLA(blur_A)
-            blur_GB_logit, blur_GB_cam_logit, _ = self.disGB(blur_B)
-            blur_LB_logit, blur_LB_cam_logit, _ = self.disLB(blur_B)
-            # 背景区域不需要判别损失，置为目标值，相当于把背景区域的判别损失置0
-            if self.args.seg_weight > 0:
-                blur_GA_logit = blur_GA_logit * (1 - fix_maskA_G) + flag_GA_0 * fix_maskA_G
-                blur_LA_logit = blur_LA_logit * (1 - fix_maskA_L) + flag_LA_0 * fix_maskA_L
-                blur_GB_logit = blur_GB_logit * (1 - fix_maskB_G) + flag_GA_0 * fix_maskB_G
-                blur_LB_logit = blur_LB_logit * (1 - fix_maskB_L) + flag_LA_0 * fix_maskB_L
-
+            cam_blur_A, cam_blur_B = None, None
+            if self.args.seg_D_cam_inp_mask:
+                cam_blur_A = self.maskA * blur_A
+                cam_blur_B = self.maskB * blur_B
+            blur_GA_logit, blur_GA_cam_logit, _ = self.disGA(blur_A, cam_blur_A, maskA)
+            blur_LA_logit, blur_LA_cam_logit, _ = self.disLA(blur_A, cam_blur_A, maskA)
+            blur_GB_logit, blur_GB_cam_logit, _ = self.disGB(blur_B, cam_blur_B, maskB)
+            blur_LB_logit, blur_LB_cam_logit, _ = self.disLB(blur_B, cam_blur_B, maskB)
+            # 无论使用什么策略，模糊图像都是false
             D_loss_GA = self.MSE_loss(blur_GA_logit, flag_GA_0)
-            D_cam_loss_GA = self.MSE_loss(blur_GA_cam_logit, flag_cam_0)
             D_loss_LA = self.MSE_loss(blur_LA_logit, flag_LA_0)
-            D_cam_loss_LA = self.MSE_loss(blur_LA_cam_logit, flag_cam_0)
             D_loss_GB = self.MSE_loss(blur_GB_logit, flag_GA_0)
-            D_cam_loss_GB = self.MSE_loss(blur_GB_cam_logit, flag_cam_0)
             D_loss_LB = self.MSE_loss(blur_LB_logit, flag_LA_0)
-            D_cam_loss_LB = self.MSE_loss(blur_LB_cam_logit, flag_cam_0)
-        D_loss_GA = D_loss_GA + self.MSE_loss(real_GA_logit, flag_GA_1) + self.MSE_loss(fake_GA_logit, flag_GA_0)
-        D_loss_GA *= self.args.forward_adv_weight
-        D_cam_loss_GA = D_cam_loss_GA + self.MSE_loss(real_GA_cam_logit, flag_cam_1) + \
-                        self.MSE_loss(fake_GA_cam_logit, flag_cam_0)
-        D_loss_LA = D_loss_LA + self.MSE_loss(real_LA_logit, flag_LA_1) + self.MSE_loss(fake_LA_logit, flag_LA_0)
-        D_loss_LA = D_loss_LA * self.args.forward_adv_weight
-        D_cam_loss_LA = D_cam_loss_LA + self.MSE_loss(real_LA_cam_logit, flag_cam_1) + \
-                        self.MSE_loss(fake_LA_cam_logit, flag_cam_0)
+            if self.args.cam_D_weight > 0:
+                D_cam_loss_GA = self.MSE_loss(blur_GA_cam_logit, flag_cam_0)
+                D_cam_loss_LA = self.MSE_loss(blur_LA_cam_logit, flag_cam_0)
+                D_cam_loss_GB = self.MSE_loss(blur_GB_cam_logit, flag_cam_0)
+                D_cam_loss_LB = self.MSE_loss(blur_LB_cam_logit, flag_cam_0)
 
-        D_loss_GB = D_loss_GB + self.MSE_loss(real_GB_logit, flag_GA_1) + self.MSE_loss(fake_GB_logit, flag_GA_0)
-        D_loss_GB *= self.args.backward_adv_weight
-        D_cam_loss_GB = D_cam_loss_GB + self.MSE_loss(real_GB_cam_logit, flag_cam_1) + \
-                        self.MSE_loss(fake_GB_cam_logit, flag_cam_0)
-        D_loss_LB = D_loss_LB + self.MSE_loss(real_LB_logit, flag_LA_1) + self.MSE_loss(fake_LB_logit, flag_LA_0)
-        D_loss_LB = D_loss_LB * self.args.backward_adv_weight
-        D_cam_loss_LB = D_cam_loss_LB + self.MSE_loss(real_LB_cam_logit, flag_cam_1) + \
-                        self.MSE_loss(fake_LB_cam_logit, flag_cam_0)
+        # 只计算分割区域的损失
+        if self.args.seg_D_mask:
+            maskA_G = F.interpolate(self.maskA, fake_GA_logit.shape[2:], mode='area')
+            maskA_L = F.interpolate(self.maskA, fake_LA_logit.shape[2:], mode='area')
+            maskB_G = F.interpolate(self.maskB, fake_GB_logit.shape[2:], mode='area')
+            maskB_L = F.interpolate(self.maskB, fake_LB_logit.shape[2:], mode='area')
 
-        D_loss_A = self.args.adv_weight * (D_loss_GA + D_cam_loss_GA + D_loss_LA + D_cam_loss_LA)
-        D_loss_B = self.args.adv_weight * (D_loss_GB + D_cam_loss_GB + D_loss_LB + D_cam_loss_LB)
+            real_GA_logit = real_GA_logit * maskA_G + flag_GA_1 * (1 - maskA_G)
+            fake_GA_logit = fake_GA_logit * maskB_G
+            real_LA_logit = real_LA_logit * maskA_L + flag_LA_1 * (1 - maskA_L)
+            fake_LA_logit = fake_LA_logit * maskB_L
+            real_GB_logit = real_GB_logit * maskB_G + flag_GA_1 * (1 - maskB_G)
+            fake_GB_logit = fake_GB_logit * maskA_G
+            real_LB_logit = real_LB_logit * maskB_L + flag_LA_1 * (1 - maskB_L)
+            fake_LB_logit = fake_LB_logit * maskA_L
+
+        if self.args.cam_D_weight > 0:
+            D_cam_loss_GA += (self.MSE_loss(real_GA_cam_logit, flag_cam_1) + self.MSE_loss(fake_GA_cam_logit, flag_cam_0))  # noqa, E501
+            D_cam_loss_LA += (self.MSE_loss(real_LA_cam_logit, flag_cam_1) + self.MSE_loss(fake_LA_cam_logit, flag_cam_0))  # noqa, E501
+            D_cam_loss_GB += (self.MSE_loss(real_GB_cam_logit, flag_cam_1) + self.MSE_loss(fake_GB_cam_logit, flag_cam_0))  # noqa, E501
+            D_cam_loss_LB += (self.MSE_loss(real_LB_cam_logit, flag_cam_1) + self.MSE_loss(fake_LB_cam_logit, flag_cam_0))  # noqa, E501
+        D_loss_GA += (self.MSE_loss(real_GA_logit, flag_GA_1) + self.MSE_loss(fake_GA_logit, flag_GA_0))
+        D_loss_LA += (self.MSE_loss(real_LA_logit, flag_LA_1) + self.MSE_loss(fake_LA_logit, flag_LA_0))
+        D_loss_A = D_loss_GA + D_loss_LA + (D_cam_loss_GA + D_cam_loss_LA) * self.args.cam_D_weight
+        D_loss_A = self.args.forward_adv_weight * self.args.adv_weight * D_loss_A
+
+        D_loss_GB += (self.MSE_loss(real_GB_logit, flag_GA_1) + self.MSE_loss(fake_GB_logit, flag_GA_0))
+        D_loss_LB += (self.MSE_loss(real_LB_logit, flag_LA_1) + self.MSE_loss(fake_LB_logit, flag_LA_0))
+        D_loss_B = D_loss_GB + D_loss_LB + (D_cam_loss_GB + D_cam_loss_LB) * self.args.cam_D_weight
+        D_loss_B = self.args.backward_adv_weight * self.args.adv_weight * D_loss_B
 
         self.discriminator_loss = D_loss_A + D_loss_B
+        # backward
         self.discriminator_loss.backward()
         return D_loss_A, D_loss_B
 
-    def backward_G(self, real_A, real_B, fake_A2B, fake_B2A, fake_A2B2A, fake_B2A2B, fake_A2A, fake_B2B,
+    def backward_G(self, real_A, real_B, fake_A2B, fake_B2A, fake_A2B2A, fake_B2A2B, fake_A2A, fake_B2B,  # noqa
                    fake_A2B_cam_logit, fake_B2A_cam_logit, fake_A2A_cam_logit, fake_B2B_cam_logit):
+        self.Generator_loss: Union[int, torch.tensor] = 0
         # 根据人脸分割，获取背景不变性损失项
-        if self.args.seg_weight > 0:
-            G_seg_loss_B = self.L1_loss(fake_A2B * self.fix_maskA, real_A * self.fix_maskA)
-            G_seg_loss_A = self.L1_loss(fake_B2A * self.fix_maskB, real_B * self.fix_maskB)
-            self.G_seg_loss = self.args.seg_weight * (G_seg_loss_A + G_seg_loss_B)
-            # 将生成图像的背景detach掉，使背景上的对抗损失梯度不影响G
-            fake_A2B = fake_A2B * (1.0 - self.fix_maskA) + fake_A2B.detach() * self.fix_maskA
-            fake_B2A = fake_B2A * (1.0 - self.fix_maskB) + fake_B2A.detach() * self.fix_maskB
+        if self.args.seg_fix_weight > 0:
+            G_seg_loss_B = self.L1_loss(fake_A2B * (1 - self.maskA_erode), real_A * (1 - self.maskA_erode))
+            G_seg_loss_A = self.L1_loss(fake_B2A * (1 - self.maskB_erode), real_B * (1 - self.maskB_erode))
+            self.G_seg_loss = self.args.seg_fix_weight * (G_seg_loss_A + G_seg_loss_B)
+            self.Generator_loss += self.G_seg_loss
+
+        if self.args.tv_loss:
+            self.tv_loss = calc_tv_loss(fake_A2B, mask=self.maskA) + calc_tv_loss(fake_B2A, mask=self.maskB)
+            self.tv_loss *= self.args.tv_weight
+            self.Generator_loss += self.tv_loss
+
+        # 将生成图像的背景detach掉，使背景上的对抗损失梯度不影响G
+        if self.args.seg_G_detach:
+            fake_A2B = fake_A2B * self.maskA + fake_A2B.detach() * (1.0 - self.maskA)
+            fake_B2A = fake_B2A * self.maskB + fake_B2A.detach() * (1.0 - self.maskB)
+
+        cam_fake_A2B, cam_fake_B2A = None, None
+        if self.args.seg_D_cam_inp_mask:
+            cam_fake_A2B = self.maskA * fake_A2B
+            cam_fake_B2A = self.maskB * fake_B2A
+
+        maskA, maskB = None, None
+        if self.args.seg_D_cam_fea_mask:
+            maskA, maskB = self.maskA, self.maskB
+
         # 判别器输出
-        fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A)
-        fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A)
-        fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B)
-        fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B)
+        fake_GA_logit, fake_GA_cam_logit, _ = self.disGA(fake_B2A, cam_fake_B2A, maskB)
+        fake_LA_logit, fake_LA_cam_logit, _ = self.disLA(fake_B2A, cam_fake_B2A, maskB)
+        fake_GB_logit, fake_GB_cam_logit, _ = self.disGB(fake_A2B, cam_fake_A2B, maskA)
+        fake_LB_logit, fake_LB_cam_logit, _ = self.disLB(fake_A2B, cam_fake_A2B, maskA)
         # 设置目标常量，GA和LA的D网络输出shape不一致，但cam的分类输出是一致的
         flag_GA_1 = torch.ones_like(fake_GA_logit, requires_grad=False).to(self.args.device)
         flag_LA_1 = torch.ones_like(fake_LA_logit, requires_grad=False).to(self.args.device)
         flag_GA_cam_1 = torch.ones_like(fake_GA_cam_logit, requires_grad=False).to(self.args.device)
+
         # 对抗损失
-        if self.args.seg_weight > 0:
+        if self.args.seg_D_mask:
             # 背景区域不需要对抗损失，置为目标值，等价于把背景区域的对抗损失置0
-            fix_maskA_G = F.interpolate(self.fix_maskA, fake_GA_logit.shape[2:], mode='area')
-            fix_maskA_L = F.interpolate(self.fix_maskA, fake_LA_logit.shape[2:], mode='area')
-            fake_GA_logit = fake_GA_logit * (1 - fix_maskA_G) + flag_GA_1 * fix_maskA_G
-            fake_LA_logit = fake_LA_logit * (1 - fix_maskA_L) + flag_LA_1 * fix_maskA_L
-            fix_maskB_G = F.interpolate(self.fix_maskB, fake_GB_logit.shape[2:], mode='area')
-            fix_maskB_L = F.interpolate(self.fix_maskB, fake_LB_logit.shape[2:], mode='area')
-            fake_GB_logit = fake_GB_logit * (1 - fix_maskB_G) + flag_GA_1 * fix_maskB_G
-            fake_LB_logit = fake_LB_logit * (1 - fix_maskB_L) + flag_LA_1 * fix_maskB_L
+            maskB_G = F.interpolate(self.maskB, fake_GA_logit.shape[2:], mode='area')
+            maskB_L = F.interpolate(self.maskB, fake_LA_logit.shape[2:], mode='area')
+            maskA_G = F.interpolate(self.maskA, fake_GB_logit.shape[2:], mode='area')
+            maskA_L = F.interpolate(self.maskA, fake_LB_logit.shape[2:], mode='area')
+            fake_GA_logit = fake_GA_logit * maskB_G + flag_GA_1 * (1 - maskB_G)
+            fake_LA_logit = fake_LA_logit * maskB_L + flag_LA_1 * (1 - maskB_L)
+            fake_GB_logit = fake_GB_logit * maskA_G + flag_GA_1 * (1 - maskA_G)
+            fake_LB_logit = fake_LB_logit * maskA_L + flag_LA_1 * (1 - maskA_L)
 
-        G_ad_loss_GA = self.MSE_loss(fake_GA_logit, flag_GA_1) * self.args.forward_adv_weight
-        G_ad_cam_loss_GA = self.MSE_loss(fake_GA_cam_logit, flag_GA_cam_1)
-        G_ad_loss_LA = self.MSE_loss(fake_LA_logit, flag_LA_1) * self.args.forward_adv_weight
-        G_ad_cam_loss_LA = self.MSE_loss(fake_LA_cam_logit, flag_GA_cam_1)
-        G_ad_loss_A = self.args.adv_weight * (G_ad_loss_GA + G_ad_cam_loss_GA + G_ad_loss_LA + G_ad_cam_loss_LA)
+        if self.args.cam_D_weight > 0:
+            G_ad_cam_loss_GA = self.MSE_loss(fake_GA_cam_logit, flag_GA_cam_1)
+            G_ad_cam_loss_LA = self.MSE_loss(fake_LA_cam_logit, flag_GA_cam_1)
+            G_ad_cam_loss_GB = self.MSE_loss(fake_GB_cam_logit, flag_GA_cam_1)
+            G_ad_cam_loss_LB = self.MSE_loss(fake_LB_cam_logit, flag_GA_cam_1)
+        else:
+            G_ad_cam_loss_GA, G_ad_cam_loss_LA, G_ad_cam_loss_GB, G_ad_cam_loss_LB = 0, 0, 0, 0
+        G_ad_loss_GA = self.MSE_loss(fake_GA_logit, flag_GA_1)
+        G_ad_loss_LA = self.MSE_loss(fake_LA_logit, flag_LA_1)
+        G_ad_loss_A = (G_ad_loss_GA + G_ad_loss_LA) + (G_ad_cam_loss_GA + G_ad_cam_loss_LA) * self.args.cam_D_weight
+        G_ad_loss_A = self.args.adv_weight * self.args.forward_adv_weight * G_ad_loss_A
 
-        G_ad_loss_GB = self.MSE_loss(fake_GB_logit, flag_GA_1) * self.args.backward_adv_weight
-        G_ad_cam_loss_GB = self.MSE_loss(fake_GB_cam_logit, flag_GA_cam_1)
-        G_ad_loss_LB = self.MSE_loss(fake_LB_logit, flag_LA_1) * self.args.backward_adv_weight
-        G_ad_cam_loss_LB = self.MSE_loss(fake_LB_cam_logit, flag_GA_cam_1)
-        G_ad_loss_B = self.args.adv_weight * (G_ad_loss_GB + G_ad_cam_loss_GB + G_ad_loss_LB + G_ad_cam_loss_LB)
+        G_ad_loss_GB = self.MSE_loss(fake_GB_logit, flag_GA_1)
+        G_ad_loss_LB = self.MSE_loss(fake_LB_logit, flag_LA_1)
+        G_ad_loss_B = (G_ad_loss_GB + G_ad_loss_LB) + (G_ad_cam_loss_GB + G_ad_cam_loss_LB) * self.args.cam_D_weight
+        G_ad_loss_B = self.args.adv_weight * self.args.backward_adv_weight * G_ad_loss_B
         # 循环一致性损失
         G_recon_loss_A = self.L1_loss(fake_A2B2A, real_A) * self.args.cycle_weight
         G_recon_loss_B = self.L1_loss(fake_B2A2B, real_B) * self.args.cycle_weight
         # 单位映射损失
         G_identity_loss_A = self.L1_loss(fake_A2A, real_A) * self.args.identity_weight
         G_identity_loss_B = self.L1_loss(fake_B2B, real_B) * self.args.identity_weight
-        # cam损失
+        # G的cam损失
         flag_cam_1 = torch.ones_like(fake_B2A_cam_logit, requires_grad=False).to(self.args.device)
         flag_cam_0 = torch.zeros_like(fake_A2A_cam_logit, requires_grad=False).to(self.args.device)
         G_cam_loss_A = self.BCE_loss(fake_B2A_cam_logit, flag_cam_1) + self.BCE_loss(fake_A2A_cam_logit, flag_cam_0)
@@ -426,15 +491,12 @@ class UGATIT(object):
         self.G_idt_loss = G_identity_loss_A + G_identity_loss_B
         self.G_cam_loss = G_cam_loss_A + G_cam_loss_B
 
-        self.Generator_loss = G_loss_A + G_loss_B
+        self.Generator_loss += (G_loss_A + G_loss_B)
 
-        # Face Segmentaion
-        if self.args.seg_weight > 0:
-            self.Generator_loss += self.G_seg_loss
-
+        # backward
         self.Generator_loss.backward()
-        return G_ad_loss_A, G_recon_loss_A, G_identity_loss_A, G_cam_loss_A, \
-               G_ad_loss_B, G_recon_loss_B, G_identity_loss_B, G_cam_loss_B
+        return (G_ad_loss_A, G_recon_loss_A, G_identity_loss_A, G_cam_loss_A,
+                G_ad_loss_B, G_recon_loss_B, G_identity_loss_B, G_cam_loss_B)
 
     def train(self):
         train_writer = SummaryWriter(os.path.join(self.args.result_dir, 'logs'))
@@ -481,6 +543,7 @@ class UGATIT(object):
             real_A, real_B, blur = self.get_batch(mode='train')
 
             self.gen_train(True)
+
             (fake_A2B, fake_A2B_cam_logit, _, _,
              fake_A2B2A, _, _,
              fake_B2A, fake_B2A_cam_logit, _, _,
@@ -501,11 +564,32 @@ class UGATIT(object):
             # Update G
             self.dis_train(False)
             self.G_optim.zero_grad()
-            G_ad_loss_A, G_recon_loss_A, G_identity_loss_A, G_cam_loss_A, \
-            G_ad_loss_B, G_recon_loss_B, G_identity_loss_B, G_cam_loss_B = \
+            (G_ad_loss_A, G_recon_loss_A, G_identity_loss_A, G_cam_loss_A,
+             G_ad_loss_B, G_recon_loss_B, G_identity_loss_B, G_cam_loss_B) = \
                 self.backward_G(real_A, real_B, fake_A2B, fake_B2A, fake_A2B2A, fake_B2A2B, fake_A2A, fake_B2B,
                                 fake_A2B_cam_logit, fake_B2A_cam_logit, fake_A2A_cam_logit, fake_B2B_cam_logit)
             self.G_optim.step()
+            self.gen_train(False)
+
+            # clip parameter of AdaLIN and LIN, applied after optimizer step
+            self.genA2B.apply(self.Rho_LIN_clipper)
+            self.genB2A.apply(self.Rho_LIN_clipper)
+            self.genA2B.apply(self.Rho_AdaLIN_clipper)
+            self.genB2A.apply(self.Rho_AdaLIN_clipper)
+            self.model_ema(step, self.genA2B_ema, self.genA2B)
+            self.model_ema(step, self.genB2A_ema, self.genB2A)
+
+            # 打印每一个step的损失
+            info = f'[{step:5d}/{self.args.iteration:5d}] time: {(time.time() - start_time):4.4f} ' \
+                   f'd_loss: {self.discriminator_loss:.8f}, g_loss: {self.Generator_loss:.8f}, ' \
+                   f'g_adv: {self.G_adv_loss:.8f}, g_cyc: {self.G_cyc_loss:.8f}, ' \
+                   f'g_idt: {self.G_idt_loss:.8f}, g_cam: {self.G_cam_loss:.8f}'
+            if self.args.seg_fix_weight > 0:
+                info += f', g_seg: {self.G_seg_loss:.8f}'
+            if self.args.tv_loss:
+                info += f', g_tv: {self.tv_loss:.8f}'
+            print(info)
+
             # 更新统计量
             G_ad_losses_A.update(G_ad_loss_A.detach().cpu().item(), real_A.size(0))
             G_recon_losses_A.update(G_recon_loss_A.detach().cpu().item(), real_A.size(0))
@@ -566,11 +650,11 @@ class UGATIT(object):
                 G_cam_losses_A.reset(), G_ad_losses_B.reset(), G_recon_losses_B.reset()
                 G_identity_losses_B.reset(), G_cam_losses_B.reset(), Generator_losses.reset()
 
-            if step % self.args.save_freq == 0:
+            if step % self.args.save_freq == 0 or step == self.args.iteration:
                 self.save(os.path.join(self.args.result_dir, self.args.dataset, 'model'), step)
 
-            if step % 1000 == 0:
-                self.save(self.args.result_dir, step=None, name='_params_latest.pt')
+            # if step % 1000 == 0:
+            #     self.save(self.args.result_dir, step=None, name='_params_latest.pt')
         train_writer.close()
 
     def calc_fid_score(self):
@@ -586,21 +670,21 @@ class UGATIT(object):
                                           batch_size=self.args.fid_batch, shuffle=False,
                                           num_workers=self.args.num_workers)
             self.fid_score.inception_model.normalize_input = False
-        mean_std_A2B = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genA2B(batch)[0].float(),
+        mean_std_A2B = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genA2B(batch)[0].detach(),
                                                              self.fid_loaderA)
         fid_score_A2B = self.fid_score.calc_fid(self.mean_std_B, mean_std_A2B)
-        mean_std_B2A = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genB2A(batch)[0].float(),
+        mean_std_B2A = self.fid_score.calc_mean_std_with_gen(lambda batch: self.genB2A(batch)[0].detach(),
                                                              self.fid_loaderB)
         fid_score_B2A = self.fid_score.calc_fid(self.mean_std_A, mean_std_B2A)
         return fid_score_A2B, fid_score_B2A
 
     def vis_inference_result(self, step, train_sample_num=5, test_sample_num=5, name=''):
-        A2B = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
-        B2A = np.zeros((self.args.img_size * (7 + self.args.attention_gan), 0, 3))
+        A2B = np.zeros((self.args.img_size * (9 + self.args.attention_gan), 0, 3))
+        B2A = np.zeros((self.args.img_size * (9 + self.args.attention_gan), 0, 3))
         self.gen_train(False), self.dis_train(False)
         for _ in range(train_sample_num):
             real_A, real_B, _ = self.get_batch(mode='train')
-            with torch.no_grad(), autocast(enabled=False):
+            with torch.no_grad():
                 (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
                  fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
                  fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
@@ -609,13 +693,29 @@ class UGATIT(object):
                  fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
                     self.forward(real_A, real_B)
 
+                cam_fake_A2B, cam_fake_B2A = None, None
+                if self.args.seg_D_cam_inp_mask:
+                    cam_fake_A2B = self.maskA * fake_A2B
+                    cam_fake_B2A = self.maskB * fake_B2A
+
+                maskA, maskB = None, None
+                if self.args.seg_D_cam_fea_mask:
+                    maskA = self.maskA
+                    maskB = self.maskB
+
+                _, _, fake_disGB_cam_hm = self.disGB(fake_A2B, cam_fake_A2B, maskA)
+                _, _, fake_disLB_cam_hm = self.disLB(fake_A2B, cam_fake_A2B, maskA)
+                _, _, fake_disGA_cam_hm = self.disGA(fake_B2A, cam_fake_B2A, maskB)
+                _, _, fake_disLA_cam_hm = self.disLA(fake_B2A, cam_fake_B2A, maskB)
             A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                         cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
                         cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
                         cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
-                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0]))),
+                        cam(tensor2numpy(fake_disGB_cam_hm[0]), self.args.img_size),
+                        cam(tensor2numpy(fake_disLB_cam_hm[0]), self.args.img_size),
                         ]
             if self.args.attention_gan > 0:
                 for i in range(self.args.attention_gan):
@@ -629,7 +729,10 @@ class UGATIT(object):
                         cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
                         cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
-                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0]))),
+                        cam(tensor2numpy(fake_disGA_cam_hm[0]), self.args.img_size),
+                        cam(tensor2numpy(fake_disLA_cam_hm[0]), self.args.img_size),
+                        ]
             if self.args.attention_gan > 0:
                 for i in range(self.args.attention_gan):
                     B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
@@ -638,7 +741,7 @@ class UGATIT(object):
 
         for _ in range(test_sample_num):
             real_A, real_B, _ = self.get_batch(mode='test')
-            with torch.no_grad(), autocast(enabled=False):
+            with torch.no_grad():
                 (fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention,
                  fake_A2B2A, fake_A2B2A_heatmap, fake_A2B2A_attention,
                  fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention,
@@ -647,13 +750,29 @@ class UGATIT(object):
                  fake_B2B, _, fake_B2B_heatmap, fake_B2B_attention) = \
                     self.forward(real_A, real_B)
 
+                cam_fake_A2B, cam_fake_B2A = None, None
+                if self.args.seg_D_cam_inp_mask:
+                    cam_fake_A2B = self.maskA * fake_A2B
+                    cam_fake_B2A = self.maskB * fake_B2A
+
+                maskA, maskB = None, None
+                if self.args.seg_D_cam_fea_mask:
+                    maskA = self.maskA
+                    maskB = self.maskB
+
+                _, _, fake_disGB_cam_hm = self.disGB(fake_A2B, cam_fake_A2B, maskA)
+                _, _, fake_disLB_cam_hm = self.disLB(fake_A2B, cam_fake_A2B, maskA)
+                _, _, fake_disGA_cam_hm = self.disGA(fake_B2A, cam_fake_B2A, maskB)
+                _, _, fake_disLA_cam_hm = self.disLA(fake_B2A, cam_fake_B2A, maskB)
             A2B_list = [RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                         cam(tensor2numpy(fake_A2A_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_A2A[0]))),
                         cam(tensor2numpy(fake_A2B_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_A2B[0]))),
                         cam(tensor2numpy(fake_A2B2A_heatmap[0]), self.args.img_size),
-                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0])))
+                        RGB2BGR(tensor2numpy(denorm(fake_A2B2A[0]))),
+                        cam(tensor2numpy(fake_disGB_cam_hm[0]), self.args.img_size),
+                        cam(tensor2numpy(fake_disLB_cam_hm[0]), self.args.img_size),
                         ]
             if self.args.attention_gan > 0:
                 for i in range(self.args.attention_gan):
@@ -667,7 +786,10 @@ class UGATIT(object):
                         cam(tensor2numpy(fake_B2A_heatmap[0]), self.args.img_size),
                         RGB2BGR(tensor2numpy(denorm(fake_B2A[0]))),
                         cam(tensor2numpy(fake_B2A2B_heatmap[0]), self.args.img_size),
-                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0])))]
+                        RGB2BGR(tensor2numpy(denorm(fake_B2A2B[0]))),
+                        cam(tensor2numpy(fake_disGA_cam_hm[0]), self.args.img_size),
+                        cam(tensor2numpy(fake_disLA_cam_hm[0]), self.args.img_size),
+                        ]
             if self.args.attention_gan > 0:
                 for i in range(self.args.attention_gan):
                     B2A_list.append(attention_mask(tensor2numpy(fake_B2A_attention[0][i:(i + 1)]),
@@ -715,7 +837,7 @@ class UGATIT(object):
         self.disLB.load_state_dict(params['disLB'])
 
     def test(self):
-        model_list = glob(os.path.join(self.args.result_dir, '*_g_params_latest.pt'))
+        model_list = glob(os.path.join(self.args.result_dir, '*_params_latest.pt'))
         if len(model_list) == 0:
             model_list = glob(os.path.join(self.args.result_dir, self.args.dataset, 'model', '*.pt'))
         if len(model_list) != 0:
@@ -725,15 +847,15 @@ class UGATIT(object):
 
         if self.args.generator_model and os.path.isfile(self.args.generator_model):
             params = torch.load(self.args.generator_model, map_location=torch.device("cpu"))
-            self.genA2B.load_state_dict(params['genA2B'])
-            self.genB2A.load_state_dict(params['genB2A'])
+            self.genA2B.load_state_dict(params['genA2B_ema'])
+            self.genB2A.load_state_dict(params['genB2A_ema'])
             print(" [*] Load SUCCESS")
         else:
             print(" [*] Load FAILURE")
             return
 
         self.genA2B.eval(), self.genB2A.eval()
-        for n, (real_A, _) in enumerate(self.testA_loader):
+        for n, real_A in tqdm(enumerate(self.testA_loader)):
             real_A = real_A.to(self.args.device)
             with torch.no_grad():
                 fake_A2B, _, fake_A2B_heatmap, fake_A2B_attention = self.genA2B(real_A)
@@ -755,7 +877,7 @@ class UGATIT(object):
             cv2.imwrite(os.path.join(self.args.result_dir, self.args.dataset, 'test', 'A2B_%d.png' % (n + 1)),
                         A2B * 255.0)
 
-        for n, (real_B, _) in enumerate(self.testB_loader):
+        for n, real_B in tqdm(enumerate(self.testB_loader)):
             real_B = real_B.to(self.args.device)
             with torch.no_grad():
                 fake_B2A, _, fake_B2A_heatmap, fake_B2A_attention = self.genB2A(real_B)
