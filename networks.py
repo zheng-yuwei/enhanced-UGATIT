@@ -21,7 +21,6 @@ class ResnetGenerator(nn.Module):
         self.attention_gan = args.attention_gan
         self.attention_input = args.attention_input
         self.use_se = args.use_se
-        self.use_deconv = args.use_deconv
 
         # 下采样模块：特征抽取、下采样、Bottleneck(resnet-block)特征编码
         DownBlock = [nn.ReflectionPad2d(3),
@@ -67,16 +66,12 @@ class ResnetGenerator(nn.Module):
         UpBlock2 = []
         for i in range(n_downsampling):
             mult = 2 ** (n_downsampling - i)
-            if self.use_deconv:
-                up_sample = [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2,
-                                                padding=1, output_padding=1, bias=True)]
-            else:
-                up_sample = [nn.Upsample(scale_factor=2, mode='nearest'),
-                             nn.ReflectionPad2d(1),
-                             nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=1, padding=0, bias=True)]
-            UpBlock2 += up_sample
-            UpBlock2 += [LIN(int(ngf * mult / 2)),
-                         nn.ReLU(True)]
+            UpBlock2 += [nn.Upsample(scale_factor=2, mode='nearest'),
+                         nn.ReflectionPad2d(1),
+                         nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=1, padding=0, bias=True),
+                         LIN(int(ngf * mult / 2)),
+                         nn.ReLU(True)
+                         ]
 
         if self.attention_gan > 0:
             UpBlock_attention = []
@@ -85,16 +80,11 @@ class ResnetGenerator(nn.Module):
                 UpBlock_attention += [ResnetBlock(ngf * mult, use_bias=False, use_se=self.use_se)]
             for i in range(n_downsampling):
                 mult = 2 ** (n_downsampling - i)
-                if self.use_deconv:
-                    up_sample = [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2,
-                                                    padding=1, output_padding=1, bias=True)]
-                else:
-                    up_sample = [nn.Upsample(scale_factor=2, mode='nearest'),
-                                 nn.ReflectionPad2d(1),
-                                 nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3,
-                                           stride=1, padding=0, bias=True)]
-                UpBlock_attention += up_sample
-                UpBlock_attention += [LIN(int(ngf * mult / 2)),
+                UpBlock_attention += [nn.Upsample(scale_factor=2, mode='nearest'),
+                                      nn.ReflectionPad2d(1),
+                                      nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3,
+                                                stride=1, padding=0, bias=True),
+                                      LIN(int(ngf * mult / 2)),
                                       nn.ReLU(True)]
             UpBlock_attention += [nn.Conv2d(ngf, self.attention_gan, kernel_size=1, stride=1, padding=0, bias=True),
                                   nn.Softmax(dim=1)]
@@ -316,8 +306,9 @@ class LIN(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, input_nc, ndf=64, n_layers=5, with_sn=True):
+    def __init__(self, input_nc, ndf=64, n_layers=5, with_sn=True, use_cam_attention=True):
         super(Discriminator, self).__init__()
+        self.use_cam_attention = use_cam_attention
         conv1 = nn.Conv2d(input_nc, ndf, kernel_size=4, stride=2, padding=0, bias=True)
         model = [nn.ReflectionPad2d(1),
                  nn.utils.spectral_norm(conv1) if with_sn else conv1,
@@ -329,6 +320,13 @@ class Discriminator(nn.Module):
             model += [nn.ReflectionPad2d(1),
                       nn.utils.spectral_norm(conv) if with_sn else conv,
                       nn.LeakyReLU(0.2, True)]
+        if n_layers < 5:
+            mult = 2 ** (n_layers - 2 - 1)
+            for i in range(0, 5 - n_layers):
+                conv = nn.Conv2d(ndf * mult, ndf * mult, kernel_size=3, stride=1, padding=0, bias=True)
+                model += [nn.ReflectionPad2d(1),
+                          nn.utils.spectral_norm(conv) if with_sn else conv,
+                          nn.LeakyReLU(0.2, True)]
 
         mult = 2 ** (n_layers - 2 - 1)
         conv2 = nn.Conv2d(ndf * mult, ndf * mult * 2, kernel_size=4, stride=1, padding=0, bias=True)
@@ -351,22 +349,33 @@ class Discriminator(nn.Module):
 
         self.model = nn.Sequential(*model)
 
-    def forward(self, in_x):
+    def forward(self, in_x, cam_input=None, mask=None):
         x = self.model(in_x)
 
-        gap = torch.nn.functional.adaptive_avg_pool2d(x, 1)
-        gap_logit = self.gap_fc(gap.view(x.shape[0], -1))
-        # gap_weight = list(self.gap_fc.parameters())[0]
-        gap_weight = sum(list(self.gap_fc.parameters()))
-        gap = x * gap_weight.unsqueeze(2).unsqueeze(3)
+        # 如果专门给CAM用的输入（例如将背景抹除的输入，这样可以使背景）不是None，则用这个输入计算logit和对应CAM
+        cam_x = self.model(cam_input) if cam_input is not None else x
 
-        gmp = torch.nn.functional.adaptive_max_pool2d(x, 1)
-        gmp_logit = self.gmp_fc(gmp.view(x.shape[0], -1))
-        # gmp_weight = list(self.gmp_fc.parameters())[0]
-        gmp_weight = sum(list(self.gmp_fc.parameters()))
-        gmp = x * gmp_weight.unsqueeze(2).unsqueeze(3)
+        if mask is not None:
+            cam_x = torch.nn.functional.interpolate(mask, cam_x.shape[2:], mode='area') * cam_x
+
+        gap = torch.nn.functional.adaptive_avg_pool2d(cam_x, 1)
+        gap_logit = self.gap_fc(gap.view(cam_x.shape[0], -1))
+        if self.use_cam_attention:
+            gap_weight = sum(list(self.gap_fc.parameters()))
+            gap = x * gap_weight.unsqueeze(2).unsqueeze(3)
+        else:
+            gap = x
+
+        gmp = torch.nn.functional.adaptive_max_pool2d(cam_x, 1)
+        gmp_logit = self.gmp_fc(gmp.view(cam_x.shape[0], -1))
+        if self.use_cam_attention:
+            gmp_weight = sum(list(self.gmp_fc.parameters()))
+            gmp = x * gmp_weight.unsqueeze(2).unsqueeze(3)
+        else:
+            gmp = x
 
         cam_logit = torch.cat([gap_logit, gmp_logit], 1)
+
         x = torch.cat([gap, gmp], 1)
         x = self.leaky_relu(self.conv1x1(x))
 
