@@ -33,8 +33,6 @@ limitations under the License.
 """
 import os
 import pathlib
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
-from multiprocessing import cpu_count
 
 import numpy as np
 import torch
@@ -42,15 +40,9 @@ import torchvision.transforms as TF
 from PIL import Image
 from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
+from tqdm import tqdm
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    # If tqdm is not available, provide a mock version of it
-    def tqdm(x):
-        return x
-
-from .inception import InceptionV3
+from metrics.fid.inception import InceptionV3
 
 # parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 # parser.add_argument('--batch-size', type=int, default=50,
@@ -327,5 +319,18 @@ class FIDScore:
 #     print('FID: ', fid_value)
 #
 #
-# if __name__ == '__main__':
-#     main()
+if __name__ == '__main__':
+    file_dir_1 = 'dataset/selfie2anime/testB'
+    file_dir_2 = 'dataset/selfie2anime/testB'
+
+    fid_score = FIDScore('cpu', batch_size=2, num_workers=1)
+    mean_std_A_1 = fid_score.calc_mean_std(file_dir_1)
+    mean_std_A_2 = fid_score.calc_mean_std(file_dir_2)
+    score = fid_score.calc_fid(mean_std_A_1, mean_std_A_2)
+    print(f'fid score between {file_dir_1} and {file_dir_2}: {score}')
+
+    mean_std_A_1 = fid_score.calc_mean_std(file_dir_1)
+    mean_std_A_2 = fid_score.calc_mean_std(file_dir_2)
+    score = fid_score.calc_fid(mean_std_A_1, mean_std_A_2)
+    print(f'fid score between {file_dir_1} and {file_dir_2}: {score}')
+
