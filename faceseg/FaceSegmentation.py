@@ -51,25 +51,31 @@ class FaceSegmentation:
             img = self.preprocessor(input_x)
             img = img.to(self.device)
             out = self.net(img)[0]
-            out = F.interpolate(out, input_x.shape[2:], mode='bilinear', align_corners=True)
-            mask = out.detach().argmax(1, keepdims=True)
+            out = F.interpolate(out, input_x.shape[2:], mode='bicubic', align_corners=True)
+            mask = out.detach().softmax(axis=1)
         return mask
 
-    def gen_mask(self, mask_tensor, dilate_parts=(), erode_parts=(0, 14, 15, 16, 18,)):
+    def gen_mask(self, mask_tensor, is_soft_edge=True,
+                 normal_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17), dilate_parts=(), erode_parts=()):
         """ 根据指定的parts生成mask numpy数组
         :param mask_tensor: face parsing 分割出来的不同类别的mask
+        :param is_soft_edge: mask是否有软边界
+        :param normal_parts: 不做操作的 前景类别列表
         :param dilate_parts: 需要做膨胀操作的 前景类别列表
-        :param erode_parts: 需要做腐蚀操作的 前景类别列表，因为要把背景分割出来，所以这里默认列表包含 0: 'background'
+        :param erode_parts: 需要做腐蚀操作的 前景类别列表
         :return mask: 前景mask
         """
         mask_tensor = mask_tensor.cpu().numpy()
-        dilate_mask = np.zeros(mask_tensor.shape, dtype=np.float32)
-        erode_mask = np.zeros(mask_tensor.shape, dtype=np.float32)
-        mask = np.ones_like(mask_tensor, dtype=np.float32)
+        N, C, H, W = mask_tensor.shape
+        normal_mask = np.zeros((N, 1, H, W), dtype=np.float32)
+        dilate_mask = np.zeros((N, 1, H, W), dtype=np.float32)
+        erode_mask = np.zeros((N, 1, H, W), dtype=np.float32)
+        for i in normal_parts:
+            normal_mask += mask_tensor[:, i, :, :]
         for i in dilate_parts:
-            dilate_mask[mask_tensor == i] = 1
+            dilate_mask += mask_tensor[:, i, :, :]
         for i in erode_parts:
-            erode_mask[mask_tensor == i] = 1
+            erode_mask += mask_tensor[:, i, :, :]
         # 闭运算 + 膨胀
         for i in range(len(dilate_mask)):
             dilate_mask[i, 0] = cv2.morphologyEx(dilate_mask[i, 0], cv2.MORPH_CLOSE, self.kernel)
@@ -78,7 +84,13 @@ class FaceSegmentation:
         for i in range(len(erode_mask)):
             erode_mask[i, 0] = cv2.morphologyEx(erode_mask[i, 0], cv2.MORPH_CLOSE, self.kernel)
             erode_mask[i, 0] = cv2.erode(erode_mask[i, 0], self.kernel, iterations=1)
-        mask = torch.from_numpy(mask * (1 - (1 - dilate_mask) * (1 - erode_mask))).to(self.device)
+        mask = np.maximum(normal_mask, dilate_mask)  # 三个区域的交集
+        mask = np.maximum(mask, erode_mask)
+        if is_soft_edge:
+            mask = ((0.7 > mask) & (mask > 0.3)) * mask + (mask > 0.7)  # 概率很高/低的区域更加hard，留下过渡区域
+        else:
+            mask = (mask >= 0.5).astype(np.float32)
+        mask = torch.from_numpy(mask).to(self.device)
         return mask
 
     def vis(self, image, mask, is_show=False):
@@ -88,17 +100,17 @@ class FaceSegmentation:
         :param is_show:是否用cv2.imshow可视化
         :return 可视化的图像
         """
+        mask = mask.cpu().numpy()
         vis_im = (image.numpy().transpose(1, 2, 0) * 127.5 + 127.5).astype(np.uint8)
-        vis_mask = mask.numpy().astype(np.uint8)
-        vis_mask_color = np.zeros((vis_mask.shape[0], vis_mask.shape[1], 3)) + 255
+        vis_mask_color = np.zeros((mask.shape[0], mask.shape[1], 3)) + 255
 
-        if mask.dtype == torch.int64:
+        if mask.dtype == np.int64:
             for pi in range(1, self.n_classes):
-                index = np.where(vis_mask == pi)
+                index = np.where(mask == pi)
                 vis_mask_color[index[0], index[1], :] = self.part_colors[pi]
         else:
-            index = np.where(vis_mask > 0.8)
-            vis_mask_color[index[0], index[1], :] = self.part_colors[1]
+            mask = np.repeat(np.expand_dims(mask, axis=-1), repeats=3, axis=-1)
+            vis_mask_color = np.array([[self.part_colors[1]]], dtype=np.float32) * mask + (1 - mask) * vis_mask_color
 
         vis_mask_color = vis_mask_color.astype(np.uint8)
         vis_im_hm = cv2.addWeighted(cv2.cvtColor(vis_im, cv2.COLOR_RGB2BGR), 0.5, vis_mask_color, 0.5, 0)
@@ -122,6 +134,12 @@ if __name__ == '__main__':
     for f_name in sorted(os.listdir(img_dir)):
         test_img = train_transform(os.path.join(img_dir, f_name))
         test_mask = face_seg.face_segmentation(test_img)
-        test_mask = face_seg.gen_mask(test_mask)  # 注释这句可以看到所有类别
+        # 注释这三句，使用下面一句，可以看到所有类别
+        test_mask0 = face_seg.gen_mask(test_mask, normal_parts=(), dilate_parts=(),
+                                       erode_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17))
+        test_mask1 = face_seg.gen_mask(test_mask, normal_parts=(1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 17),
+                                       dilate_parts=(), erode_parts=(6, ))
+        test_mask = test_mask0 * test_mask1
+        # test_mask = test_mask.argmax(1, keepdims=True)
         vis_img = face_seg.vis(test_img[0], test_mask[0, 0], is_show=True)
         cv2.imwrite(f_name, vis_img)
