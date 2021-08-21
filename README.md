@@ -9,10 +9,28 @@
 ## Usage
 
 ```shell
-CUDA_VISIBLE_DEVICES=2 python main.py --dataset YOUR_DATASET_NAME --light 32 --result_dir YOUR_RESULT_DIR \
+CUDA_VISIBLE_DEVICES=2 python main.py --dataset YOUR_DATASET_NAME --result_dir YOUR_RESULT_DIR \
+# 适当减小light可降低显存的使用
+ --light 32 \
 --img_size 384 --aug_prob 0.2 --device cuda:0 --num_worker 1 --print_freq 1000 --calc_fid_freq 10000 --save_freq 100000 \
---ema_start 0.5 --ema_beta 0.9999 -adv_weight 1.0 --forward_adv_weight 1 --cycle_weight 10 --identity_weight 10 \
---seg_weight 50 --seg_rand_mask 0.8 --attention_gan 3 --attention_input --has_blur --use_se
+# 适当提高forward_adv_weight系数可适当增强 A2B的风格化程度
+--adv_weight 1.0 --forward_adv_weight 1 --cycle_weight 10 --identity_weight 10 \
+# ema大幅提高模型稳定性和fid
+--ema_start 0.5 --ema_beta 0.9999 \
+# 固定背景参数
+# 去除判别器中的CAM和logit loss
+--cam_D_weight -1 --cam_D_attention \
+# 使用faceseg分割出背景做L1损失
+--seg_fix_weight 100 \
+# 背景的判别器损失丢弃mask区域的损失
+--seg_D_mask \
+# 背景detach
+--seg_G_detach \
+# D判别器可以设置较为local
+--n_global_dis 7 --n_local_dis 5
+--has_blur --use_se
+# 如果attention_input想配合背景固定一起用的话，建议加大对抗loss的权重 adv_weight -> 10 甚至更大
+--attention_gan 2 --attention_input
 ```
 
 本地调试的话：`--device cuda:0` -> `--device cpu`，
@@ -22,8 +40,7 @@ CUDA_VISIBLE_DEVICES=2 python main.py --dataset YOUR_DATASET_NAME --light 32 --r
 - 代码结构优化：
   - 将`UGATIT.py`中的`train`函数的部分代码模块化为函数(`get_batch, forward, backward_G, backward_D`);
   - 增加训练时损失函数的打印，tensorboard记录；
-  - 优化了官方代码中一次多余的前向推理，约节省20%的训练时间；
-  - 混合精度训练，速度提升约 30~40%，显存也节约很多。
+  - 优化了官方代码中一次多余的前向推理，约节省20%的训练时间。
   
 - 功能增强（可选是否开启）：
   - `--ema_start`: 开始做模型ema的迭代次数的比例数，也就是`--iteration 100 --ema_start 0.7`表示 `100 * 0.7 = 70` 个迭代后开始做模型ema；
@@ -41,15 +58,17 @@ CUDA_VISIBLE_DEVICES=2 python main.py --dataset YOUR_DATASET_NAME --light 32 --r
   - `--use_se`: 在生成网络中，是否给每个`ResnetBlock, ResnetAdaILNBlock`增加`scse block`；[4]
   - `--attention_gan`: 生成网络中，是否使用`attention mask`机制（在上采样前多一个分支，用于生成mask）；[5]
   - `--use_deconv`: 生成网络中，上采样是否使用反卷积`nn.ConvTranspose2d`，默认使用插值+卷积方式；
-  - `--seg_weight`: 人脸分割[6]损失权重（本库代码默认的分割区域为下图的二分类图，借鉴的库可实现多个类别的解析），
-  1. 将原图与生成图在背景区域上做L1损失；2. 生成图的背景区域detach掉再放入D网络做对抗；3. 背景区域的对抗损失置0；4. 背景区域的判别损失置0；
-  - `--seg_rand_mask`: 配合分割权重一起用，5. 训练D网络时，整个背景替换为某一个随机值的随机概率。
-    `--seg_weight` 和 `--seg_rand_mask` 的目的是：G对背景是单位映射（1） + 让D不影响G的背景（2，3） + 让D不依赖背景做判断（4，5），从而使得整个训练过程和尽量背景无关。
+  - `--seg_fix_weight`: 人脸分割[6]损失权重（本库代码默认的分割区域为下图的二分类图，借鉴的库可实现多个类别的解析），将原图与生成图在背景区域上做L1损失；
+  - `--seg_D_mask`: 背景区域的对抗损失置0、背景区域的判别损失置0；
+  - `--seg_G_detach`: 生成图的背景区域detach掉再放入D网络做对抗；
+  - `--seg_D_cam_inp_mask`: 训练D网络时，整个背景替换为0作为CAM分支的输入；
+  - `--seg_D_cam_fea_mask`: 训练D网络时，将CAM分支的feature map的背景区域替换为0；
+  - `--cam_D_weight -1 --cam_D_attention`: 将CAM的attention和logit loss砍掉。
 
 ![背景分割](./assets/bg_parsing_boy.png) ![人脸解析](./assets/face_parsing_boy.png)
 
 - 其他功能：
-  - `--phase`: 模型的视频/摄像头/图片文件夹测试（`video | camera | img_dir`），图片文件测试（`test`）；
+  - `--phase`: 模型的训练/验证/测试/视频/视频文件夹/摄像头/图像文件夹/以对齐的人脸图像文件夹 模式（`'train', 'val', 'test', 'video', 'video_dir', 'camera', 'img_dir', 'generate'`）；
 
 ## 文件目录说明
 
