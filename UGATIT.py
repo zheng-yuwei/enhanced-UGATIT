@@ -274,27 +274,27 @@ class UGATIT(object):
         # 根据人脸分割，获取分割区域 self.maskA (==1)
         if self.use_seg:
             maskA = self.FaceSeg.face_segmentation(real_A)
-            self.maskA = self.FaceSeg.gen_mask(maskA, is_soft_edge=self.args.hard_seg_edge,
+            self.maskA = self.FaceSeg.gen_mask(maskA, is_soft_edge=not self.args.hard_seg_edge,
                                                normal_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17),
                                                dilate_parts=(), erode_parts=())
             self.maskA_erode = self.FaceSeg.gen_mask(maskA, normal_parts=(), dilate_parts=(),
-                                                     is_soft_edge=self.args.hard_seg_edge,
+                                                     is_soft_edge=not self.args.hard_seg_edge,
                                                      erode_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17))
             if self.args.seg_fix_glass_mouth:
                 maskA_erode = self.FaceSeg.gen_mask(maskA, normal_parts=(1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 17),
-                                                    dilate_parts=(), is_soft_edge=self.args.hard_seg_edge,
+                                                    dilate_parts=(), is_soft_edge=not self.args.hard_seg_edge,
                                                     erode_parts=(6, ))
                 self.maskA_erode *= maskA_erode
             maskB = self.FaceSeg.face_segmentation(real_B)
-            self.maskB = self.FaceSeg.gen_mask(maskB, is_soft_edge=self.args.hard_seg_edge,
+            self.maskB = self.FaceSeg.gen_mask(maskB, is_soft_edge=not self.args.hard_seg_edge,
                                                normal_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17),
                                                dilate_parts=(), erode_parts=())
             self.maskB_erode = self.FaceSeg.gen_mask(maskB, normal_parts=(), dilate_parts=(),
-                                                     is_soft_edge=self.args.hard_seg_edge,
+                                                     is_soft_edge=not self.args.hard_seg_edge,
                                                      erode_parts=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17))
             if self.args.seg_fix_glass_mouth:
                 maskB_erode = self.FaceSeg.gen_mask(maskB, normal_parts=(1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 17),
-                                                    dilate_parts=(), is_soft_edge=self.args.hard_seg_edge,
+                                                    dilate_parts=(), is_soft_edge=not self.args.hard_seg_edge,
                                                     erode_parts=(6, ))
                 self.maskB_erode *= maskB_erode
 
