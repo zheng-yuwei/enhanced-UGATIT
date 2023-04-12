@@ -808,7 +808,7 @@ class UGATIT(object):
                 p_ema.copy_(p.lerp(p_ema, self.args.ema_beta))
         else:
             for p_ema, p in zip(G_ema.parameters(), G.parameters()):
-                p_ema.copy_(p_ema)
+                p_ema.copy_(p)
         for b_ema, b in zip(G_ema.buffers(), G.buffers()):
             b_ema.copy_(b)
         return
